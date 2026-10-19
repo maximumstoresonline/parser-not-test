@@ -4,13 +4,14 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import gspread
 
+from product_keys import asin_of, product_key
 from config import COMPETITOR_ASIN_HEADERS, CONFIG_HEADER, CONFIG_SHEET_NAME, MATRIX_SHEET_NAME, SHEET_NAME
 from utils import clean_number, normalize_header, extract_asin_from_text, build_parent_formula, logger
 
 # Кэш "предыдущего" BSR на уровне процесса — см. _get_previous_bsr_snapshot() ниже.
 # Живёт, пока жив процесс (один запуск parser_not_test.py = один процесс = кэш
 # сбрасывается сам собой при следующем запуске скрипта).
-_PREVIOUS_BSR_SNAPSHOT_CACHE: Optional[Dict[Tuple[Optional[str], Optional[str]], Dict[str, Any]]] = None
+_PREVIOUS_BSR_SNAPSHOT_CACHE: Optional[Dict[Tuple[Optional[str], ...], Dict[str, Any]]] = None
 
 
 def get_or_create_worksheet(
@@ -420,6 +421,18 @@ def _append_checked_rows_to_history(
     return len(data_to_append)
 
 
+def _collected_key(products_by_asin: Dict, failed: set, marketplace: Optional[str], asin: Optional[str]) -> Optional[str]:
+    """Под каким ключом лежит товар строки: «страна:ASIN» (сбор по парам из базы) или голый ASIN
+    (TEST_ASIN, старый режим через Competitors). Сначала ключ со страной: ASIN из DE не должен
+    получить данные, собранные для FR (см. product_keys.py)."""
+    if not asin:
+        return asin
+    key = product_key(marketplace or "US", asin)
+    if key in products_by_asin or key in failed:
+        return key
+    return asin
+
+
 def _refresh_current_sheet_from_matrix(
     matrix_sheet: gspread.Worksheet,
     products_by_asin: Dict,
@@ -501,12 +514,18 @@ def _refresh_current_sheet_from_matrix(
 
         our_asin = extract_asin_from_text(row[columns["our_asin"]]) if "our_asin" in columns else None
         comp_asin = extract_asin_from_text(row[columns["comp_asin"]]) if "comp_asin" in columns else None
-        previous_pair_values = previous_bsr_by_pair.get((our_asin, comp_asin), {})
+        row_market = (row[columns["marketplace"]] if "marketplace" in columns else "") or "US"
+        previous_pair_values = previous_bsr_by_pair.get(
+            (str(row_market).strip().upper(), our_asin, comp_asin),
+            previous_bsr_by_pair.get((our_asin, comp_asin), {}),
+        )
 
-        our_product = products_by_asin.get(our_asin)
-        comp_product = products_by_asin.get(comp_asin)
-        our_checked = our_asin in products_by_asin or our_asin in failed_asins_set
-        comp_checked = comp_asin in products_by_asin or comp_asin in failed_asins_set
+        our_key = _collected_key(products_by_asin, failed_asins_set, row_market, our_asin)
+        comp_key = _collected_key(products_by_asin, failed_asins_set, row_market, comp_asin)
+        our_product = products_by_asin.get(our_key)
+        comp_product = products_by_asin.get(comp_key)
+        our_checked = our_key in products_by_asin or our_key in failed_asins_set
+        comp_checked = comp_key in products_by_asin or comp_key in failed_asins_set
 
         # Очищаем старые вычисляемые значения
         for field in (
@@ -540,7 +559,7 @@ def _refresh_current_sheet_from_matrix(
                 row[columns["our_rating"]] = _metric_or_blank(our_product.get("stars"))
             if "our_reviews_count" in columns:
                 row[columns["our_reviews_count"]] = _metric_or_blank(our_product.get("reviews"))
-        elif our_asin in failed_asins_set and our_asin:
+        elif our_key in failed_asins_set and our_asin:
             for field in (
                 "our_product",
                 "our_bsr",
@@ -581,7 +600,7 @@ def _refresh_current_sheet_from_matrix(
                 row[columns["comp_rating"]] = _metric_or_blank(comp_product.get("stars"))
             if "comp_reviews_count" in columns:
                 row[columns["comp_reviews_count"]] = _metric_or_blank(comp_product.get("reviews"))
-        elif comp_asin in failed_asins_set and comp_asin:
+        elif comp_key in failed_asins_set and comp_asin:
             for field in (
                 "competitor",
                 "comp_bsr",
@@ -632,8 +651,8 @@ def _refresh_current_sheet_from_matrix(
         # сохранении в History заново попадали бы все пары, обработанные с начала прогона.
         if history_asins_set is not None:
             pair_in_this_call = bool(
-                (our_asin and our_asin in history_asins_set)
-                or (comp_asin and comp_asin in history_asins_set)
+                (our_asin and our_key in history_asins_set)
+                or (comp_asin and comp_key in history_asins_set)
             )
         else:
             pair_in_this_call = our_checked or comp_checked
@@ -728,7 +747,8 @@ def _highlight_failed_asins_in_sheet(
                 if col_index is None or col_index >= len(row):
                     continue
                 asin = extract_asin_from_text(row[col_index])
-                if asin and asin in failed_asins_set:
+                market = row[columns["marketplace"]] if "marketplace" in columns and columns["marketplace"] < len(row) else ""
+                if asin and (asin in failed_asins_set or product_key(market or "US", asin) in failed_asins_set):
                     col_letter = _column_letter(col_index)
                     format_requests.append({"range": f"{col_letter}{row_number}", "format": yellow_format})
 
@@ -776,8 +796,9 @@ def mark_failed_asins_in_competitors(
     if our_asin_col is None and comp_asin_col is None:
         return
 
-    failed_set = {str(a).strip().upper() for a in (failed_asins or []) if a}
-    scraped_set = {str(a).strip().upper() for a in (products_by_asin or {}).keys() if a}
+    # Лист Competitors размечается по голому ASIN: ключи «страна:ASIN» сводим к ASIN.
+    failed_set = {asin_of(a) for a in (failed_asins or []) if a}
+    scraped_set = {asin_of(a) for a in (products_by_asin or {}).keys() if a}
 
     format_requests = []
 
@@ -837,7 +858,7 @@ _PRESERVABLE_FIELDS = (
 
 def _get_previous_bsr_snapshot(
     spreadsheet: gspread.Spreadsheet,
-) -> Dict[Tuple[Optional[str], Optional[str]], Dict[str, Any]]:
+) -> Dict[Tuple[Optional[str], ...], Dict[str, Any]]:
     """
     Читает состояние листа "Current" КАК ОНО БЫЛО ДО начала текущего прогона —
     и делает это только один раз за весь процесс (см. _PREVIOUS_BSR_SNAPSHOT_CACHE).
@@ -858,7 +879,7 @@ def _get_previous_bsr_snapshot(
     if _PREVIOUS_BSR_SNAPSHOT_CACHE is not None:
         return _PREVIOUS_BSR_SNAPSHOT_CACHE
 
-    previous_bsr_by_pair: Dict[Tuple[Optional[str], Optional[str]], Dict[str, Any]] = {}
+    previous_bsr_by_pair: Dict[Tuple[Optional[str], ...], Dict[str, Any]] = {}
     try:
         existing_current_sheet = get_or_create_worksheet(spreadsheet, "Current")
         existing_current_rows = existing_current_sheet.get_all_values()
@@ -883,13 +904,19 @@ def _get_previous_bsr_snapshot(
                 )
                 if not prev_comp_asin:
                     continue
-                previous_bsr_by_pair[(prev_our_asin, prev_comp_asin)] = {
+                values = {
                     field: (
                         prev_row[prev_columns[field]]
                         if field in prev_columns and len(prev_row) > prev_columns[field] else ""
                     )
                     for field in _PRESERVABLE_FIELDS
                 }
+                previous_bsr_by_pair[(prev_our_asin, prev_comp_asin)] = values
+                # Одна и та же пара может стоять на нескольких рынках: прошлое значение ищется сначала
+                # по ключу со страной, чтобы дельта DE не считалась от вчерашнего BSR из FR.
+                if "marketplace" in prev_columns and len(prev_row) > prev_columns["marketplace"]:
+                    market = str(prev_row[prev_columns["marketplace"]]).strip().upper() or "US"
+                    previous_bsr_by_pair[(market, prev_our_asin, prev_comp_asin)] = values
 
     _PREVIOUS_BSR_SNAPSHOT_CACHE = previous_bsr_by_pair
     return previous_bsr_by_pair
@@ -956,7 +983,7 @@ def refresh_current_matrix(current_sheet, products_by_asin, snapshot_date, faile
             )
 
         asin = extract_asin_from_text(old_row[columns["asin"]])
-        product = products_by_asin.get(asin)
+        product = products_by_asin.get(_collected_key(products_by_asin, set(), marketplace, asin))
         row_number = first_data_index + 1 + data_index
 
         if product:

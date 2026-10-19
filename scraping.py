@@ -7,6 +7,7 @@ from urllib3.util import Retry
 from requests.adapters import HTTPAdapter
 
 from amazon_location import location_params
+from product_keys import domain_of, split_key
 from config import DOMAIN, MAX_CONCURRENT_WORKERS, get_scrapingdog_token
 from utils import ProductData, clean_number, extract_bsr, extract_category, extract_price, logger
 
@@ -263,6 +264,10 @@ def fetch_products_concurrent(
     только на своём маркетплейсе, и запрос "чужого" ASIN на amazon.com часто
     возвращает ошибку/не тот товар, даже если на своём домене (amazon.ca, amazon.co.uk
     и т.д.) он существует.
+
+    Элемент asins может быть ключом «страна:ASIN» (product_keys): тогда домен берётся из ключа, а
+    словарь результата и список упавших — по ключу. Так один ASIN из DE и FR собирается дважды, на
+    каждом рынке свой ответ. Голый ASIN работает как раньше (домен из asin_domains).
     """
     token = token or get_scrapingdog_token()
     session = _get_http_session()
@@ -276,10 +281,11 @@ def fetch_products_concurrent(
         nonlocal completed_count
         failed: List[str] = []
 
-        def task(asin: str) -> Tuple[str, Optional[dict]]:
-            asin_domain = (asin_domains or {}).get(asin, domain)
+        def task(item: str) -> Tuple[str, Optional[dict]]:
+            asin = split_key(item)[1]
+            asin_domain = domain_of(item) or (asin_domains or {}).get(asin, domain)
             data = fetch_product(asin, domain=asin_domain, token=token, session=session)
-            return asin, data
+            return item, data
 
         with ThreadPoolExecutor(max_workers=min(max_workers, len(pending) or 1)) as executor:
             futures = {executor.submit(task, asin): asin for asin in pending}
@@ -294,7 +300,7 @@ def fetch_products_concurrent(
                     if data is None:
                         failed.append(asin)
                     else:
-                        product = parse_product(data, asin=asin)
+                        product = parse_product(data, asin=split_key(asin)[1])
                         collected.append(product)
                         products_by_asin[asin] = product
                         logger.info(f"Успешно обработан [{asin}]: {product.title[:50]}... | Цена: {product.price} | BSR: {product.bsr}")

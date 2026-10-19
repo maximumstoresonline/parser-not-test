@@ -31,20 +31,18 @@ class Positions:
 
 
 def positions_summary(pairs: Iterable[Tuple[str, str, str, bool]]) -> Positions:
-    """Сколько ASIN уйдёт в каждый сбор. Как у парсера: ASIN запрашивается один раз, на рынке своей пары
-    (при повторе в разных рынках побеждает более поздняя пара в порядке «рынок, наш ASIN»). «Наш» — ASIN,
-    который хотя бы в одной активной паре стоит как наш; остальные — конкуренты, поэтому сумма всегда равна total."""
-    active = sorted(((market, our, comp) for market, our, comp, is_active in pairs if is_active), key=lambda p: (p[0], p[1]))
-    market_of: Dict[str, str] = {}
-    for market, our, comp in active:
-        market_of[our] = market
-        market_of[comp] = market
-    ours = {our for _, our, _ in active}
+    """Сколько ASIN уйдёт в каждый сбор. Как у парсера (db_pairs.product_keys_from_pairs): ASIN запрашивается
+    на каждом рынке, где он стоит в активной паре, — у него в каждой стране свои BSR и цена. «Наш» — ASIN,
+    который хотя бы в одной активной паре своего рынка стоит как наш; остальные — конкуренты, поэтому сумма
+    всегда равна total."""
+    active = [(market, our, comp) for market, our, comp, is_active in pairs if is_active]
+    keys = {(market, asin) for market, our, comp in active for asin in (our, comp)}
+    ours = {(market, our) for market, our, _ in active}
     return Positions(
-        total=len(market_of),
+        total=len(keys),
         ours=len(ours),
-        competitors=len(market_of.keys() - ours),
-        by_market=dict(Counter(market_of.values())),
+        competitors=len(keys - ours),
+        by_market=dict(Counter(market for market, _ in keys)),
     )
 
 

@@ -16,7 +16,7 @@ from config import (
     resolve_asins_from_environment,
 )
 from scraping import fetch_products_concurrent
-from db_pairs import asins_from_pairs, build_asin_domain_map_from_db, load_active_competitor_pairs_from_db
+from db_pairs import build_asin_domain_map_from_db, product_keys_from_pairs, load_active_competitor_pairs_from_db
 from db_subscribers import get_active_subscriber_ids_from_db
 from sheets import _amazon_domain, build_asin_domain_map, connect_sheet, load_asins_from_config, refresh_current_matrix
 from subscribers import get_active_subscriber_ids
@@ -247,7 +247,9 @@ def run_parser(progress_callback: Optional[Callable[[float, str], None]] = None)
             if pair_source == "database":
                 pairs = load_active_competitor_pairs_from_db()
                 layout_pairs = pairs
-                asins = resolve_asins_from_environment(asins_from_pairs(pairs, scope=collect_scope))
+                # Ключи «страна:ASIN», а не голые ASIN: один ASIN из пар DE и FR собирается на каждом рынке
+                # отдельно (см. product_keys.py).
+                asins = resolve_asins_from_environment(product_keys_from_pairs(pairs, scope=collect_scope))
                 logger.info(f"PAIR_SOURCE=database. Область сбора: {collect_scope}. Получено ASIN для проверки: {len(asins)}")
                 try:
                     asin_domains = build_asin_domain_map_from_db()

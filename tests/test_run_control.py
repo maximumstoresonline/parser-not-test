@@ -62,18 +62,20 @@ def test_inactive_pairs_are_not_collected():
     assert run_control.positions_summary(pairs) == Positions(total=2, ours=1, competitors=1, by_market={"US": 2})
 
 
-def test_an_asin_in_two_marketplaces_is_requested_once_on_the_later_pairs_market():
+def test_an_asin_in_two_marketplaces_is_requested_on_each_of_them():
+    # BSR и цена у ASIN в каждой стране свои: раньше он собирался один раз и данные одной страны
+    # расходились по строкам обеих (проверка 19.10.2026).
     pairs = [pair("US", "B0OUR00002", "B0COMP0001"), pair("CA", "B0OUR00001", "B0COMP0001")]
     result = run_control.positions_summary(pairs)
-    assert result.total == 3
-    assert result.by_market == {"CA": 1, "US": 2}
+    assert result.total == 4
+    assert result.by_market == {"CA": 2, "US": 2}
     assert run_control.positions_summary(reversed(pairs)) == result
 
 
-def test_an_asin_that_is_ours_in_one_pair_and_a_competitor_in_another_counts_once_as_ours():
+def test_ours_and_competitors_are_counted_per_market():
     pairs = [pair("US", "B0OUR00001", "B0OUR00002"), pair("US", "B0OUR00002", "B0COMP0001"), pair("CA", "B0OUR00003", "B0COMP0001")]
     result = run_control.positions_summary(pairs)
-    assert result.ours == 3 and result.competitors == 1 and result.total == 4
+    assert result.ours == 3 and result.competitors == 2 and result.total == 5
     assert result.ours + result.competitors == result.total == sum(result.by_market.values())
 
 

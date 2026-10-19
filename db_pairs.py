@@ -15,6 +15,7 @@ from typing import Dict, List
 
 import psycopg2
 
+from product_keys import product_key
 from sheets import _amazon_domain
 
 
@@ -70,8 +71,8 @@ def asins_from_pairs(pairs: List[Dict[str, str]], scope: str = "all") -> List[st
 
     scope сужает список для частичного сбора: "ours" — только наши товары, "competitors" —
     только конкуренты, "all" (по умолчанию) — все, как раньше. "Наш" — ASIN, который хотя бы в
-    одной активной паре стоит как our_asin (то же правило, что в run_control.positions_summary,
-    чтобы число ASIN на кнопке совпадало с тем, что реально уйдёт в сбор).
+    одной активной паре стоит как our_asin. Сбор идёт по product_keys_from_pairs (ASIN отдельно на
+    каждом рынке); здесь — голые ASIN без страны.
     """
     if scope not in ("all", "ours", "competitors"):
         scope = "all"
@@ -86,4 +87,27 @@ def asins_from_pairs(pairs: List[Dict[str, str]], scope: str = "all") -> List[st
             if scope == "competitors" and asin in our_asins:
                 continue
             seen[asin] = None
+    return list(seen.keys())
+
+
+def product_keys_from_pairs(pairs: List[Dict[str, str]], scope: str = "all") -> List[str]:
+    """Что собирать: ключи «страна:ASIN» (product_keys) в порядке пар, без повторов.
+
+    В отличие от asins_from_pairs, ASIN из пар разных стран даёт отдельный ключ на каждую страну:
+    у него на каждом рынке свои BSR и цена. «Наш» — ключ, который хотя бы в одной активной паре своего
+    рынка стоит как our_asin (run_control.positions_summary считает по тому же правилу)."""
+    if scope not in ("all", "ours", "competitors"):
+        scope = "all"
+    ours = {product_key(pair["marketplace"], pair["our_asin"]) for pair in pairs if pair["our_asin"]}
+    seen: Dict[str, None] = {}
+    for pair in pairs:
+        for asin in (pair["our_asin"], pair["comp_asin"]):
+            if not asin:
+                continue
+            key = product_key(pair["marketplace"], asin)
+            if scope == "ours" and key not in ours:
+                continue
+            if scope == "competitors" and key in ours:
+                continue
+            seen[key] = None
     return list(seen.keys())
