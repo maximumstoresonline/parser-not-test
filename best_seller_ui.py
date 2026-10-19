@@ -151,6 +151,9 @@ _CSS = """
 .bs-bar { height:8px; background:#e5e7eb; border-radius:999px; overflow:hidden; margin:.6rem 0 .2rem; }
 .bs-bar > div { height:100%; background:#0f4c75; border-radius:999px; }
 .bs-retry { color:#0f4c75; text-decoration:underline; font-size:.82rem; margin-left:.4rem; }
+.bs-top { max-height:320px; overflow-y:auto; border:1px solid #e5e7eb; border-radius:10px; padding:.4rem .8rem;
+          background:#fff; font-size:.84rem; line-height:1.5; color:#111827; }
+.bs-top span { color:#64748b; display:inline-block; min-width:2.4rem; font-variant-numeric:tabular-nums; }
 .bs-progress-title { font-weight:750; font-size:1.05rem; color:#111827; }
 </style>
 """
@@ -485,6 +488,57 @@ def _render_single(connect=None, actor: str = "", can_edit: bool = False, token:
         return
     _results(f"{found['market']}_{found['asin']}", _found_pairs(found))
     _legend()
+    _relevance_review(connect, found, can_edit)
+
+
+_RELEVANCE_ORDER = (best_seller.RELEVANT, best_seller.SEMI_RELEVANT, best_seller.RISKY, best_seller.IRRELEVANT)
+RELEVANCE_HINT = ("Релевантная — в топе тот же тип товара (шапка → Sun Hats). Полурелевантная — смесь товаров одной "
+                  "темы (шапка → Women's Ice Skating Clothing). Рискованная — только один чужой тип (бини → Trapper "
+                  "Hats, одни ушанки). Нерелевантная — совсем другой товар (шапка → Cycling Helmets).")
+
+
+def _top_html(top: Sequence[dict]) -> str:
+    lines = "".join(f"<div><span>#{row.get('rank', '')}</span>{escape(str(row.get('title') or ''))}</div>"
+                    for row in top if row.get("title"))
+    return f'<div class="bs-top">{lines}</div>'
+
+
+def _relevance_review(connect, found: dict, can_edit: bool) -> None:
+    """К3 без ИИ, как в SOP (раздел 5): сотрудник смотрит заголовки топа и выбирает одну из четырёх оценок. Только
+    для подкатегорий, прошедших К1 и К2, — у остальных К3 не проверяется."""
+    rows = [row for row in found["results"] if row["k1"] and row["k2"]]
+    if not rows:
+        return
+    rows.sort(key=lambda row: row["relevance"] is not None)  # неоценённые сверху
+    st.markdown('<p class="section-title">Оценка релевантности (К3)</p>', unsafe_allow_html=True)
+    st.markdown(f'<p class="section-note">Посмотрите, что стоит в топе подкатегории, и выберите оценку. '
+                f'{escape(RELEVANCE_HINT)}</p>', unsafe_allow_html=True)
+    domain = pairs_store.DOMAIN_BY_MARKET.get(found["market"], "com")
+    for row in rows:
+        state = best_seller.RELEVANCE_LABELS.get(row["relevance"], "не оценена")
+        with st.expander(f"{row['name'] or row['node']} — {state}", expanded=row["relevance"] is None):
+            if row.get("dept"):
+                st.markdown(f"[Открыть подкатегорию на Amazon](https://www.amazon.{domain}/gp/bestsellers/"
+                            f"{row['dept']}/{row['node']})")
+            top = [x for x in (row.get("top") or []) if isinstance(x, dict)]
+            if any(x.get("title") for x in top):
+                st.markdown(_top_html(top), unsafe_allow_html=True)
+            else:
+                st.caption("Заголовки топа не сохранены — откройте подкатегорию на Amazon.")
+            key = f"{found['id']}_{row['node']}"
+            current = _RELEVANCE_ORDER.index(row["relevance"]) if row["relevance"] in _RELEVANCE_ORDER else None
+            choice = st.radio("Оценка", _RELEVANCE_ORDER, index=current, horizontal=True, key=f"bs_rel_{key}",
+                              format_func=best_seller.RELEVANCE_LABELS.get, disabled=not can_edit)
+            if not can_edit:
+                st.caption("Оценивать может сотрудник с правом редактирования.")
+            elif st.button("Сохранить оценку", key=f"bs_rel_save_{key}", disabled=choice is None):
+                try:
+                    best_seller_store.set_relevance(connect, found["id"], row["node"], choice,
+                                                    actor_role=access.ROLE_EDITOR)
+                except (best_seller_store.BestSellerStoreError, access.AccessDenied) as exc:
+                    st.error(str(exc))
+                else:
+                    st.rerun()
 
 
 def _batch_table(rows: Sequence[BatchRow]) -> str:

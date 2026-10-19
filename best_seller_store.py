@@ -214,12 +214,50 @@ def latest_search(connect: Connect, market: str, asin: str) -> Optional[dict]:
     if not rows:
         return None
     sid, title, our, target, status, error, own, requests, actor, finished = rows[0]
+    # top — заголовки топа подкатегории из недельного кэша: по ним сотрудник оценивает К3 (SOP: «посмотреть, что
+    # стоит в топе»). Берутся только там, где К3 вообще оценивается (К1 и К2 пройдены).
     results = _run(connect, """
-        SELECT node, name, path, leader_bsr, k1, k2, k3, k4, relevance, status, priority, reason
-        FROM best_seller.search_results WHERE search_id = %s
-        ORDER BY CASE status WHEN 'suitable' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END, leader_bsr DESC NULLS LAST;
-        """, (sid,), fetch=True)
-    keys = ("node", "name", "path", "leader_bsr", "k1", "k2", "k3", "k4", "relevance", "status", "priority", "reason")
+        SELECT r.node, r.name, r.path, r.leader_bsr, r.k1, r.k2, r.k3, r.k4, r.relevance, r.status, r.priority,
+               r.reason, CASE WHEN r.k1 AND r.k2 THEN c.top END, c.dept
+        FROM best_seller.search_results r
+        LEFT JOIN best_seller.node_cache c ON c.marketplace = %s AND c.node = r.node
+        WHERE r.search_id = %s
+        ORDER BY CASE r.status WHEN 'suitable' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END, r.leader_bsr DESC NULLS LAST;
+        """, (market, sid), fetch=True)
+    keys = ("node", "name", "path", "leader_bsr", "k1", "k2", "k3", "k4", "relevance", "status", "priority", "reason",
+            "top", "dept")
     return {"id": sid, "market": market, "asin": asin, "title": title, "our_bsr": our, "target_bsr": target,
             "status": status, "error": error, "own": list(own or []), "requests": requests, "actor": actor,
             "finished_at": finished, "results": [dict(zip(keys, row)) for row in results]}
+
+
+def set_relevance(connect: Connect, search_id: int, node: str, relevance: str, *,
+                  actor_role: Optional[str]) -> "best_seller.Verdict":
+    """Оценка К3 сотрудником (SOP, раздел 5: посмотреть, что стоит в топе) — без ИИ. Решение по подкатегории
+    пересчитывается теми же правилами best_seller.evaluate: дальше проверяется К4 по бейджу лидера из кэша."""
+    import best_seller
+
+    access.require_role(actor_role, access.ROLE_EDITOR)
+    if relevance not in best_seller.RELEVANCE_LABELS:
+        raise BestSellerStoreError("Неизвестная оценка релевантности.")
+    rows = _run(connect, """
+        SELECT s.target_bsr, r.leader_bsr, r.k1, r.k2, c.leader_badge
+        FROM best_seller.search_results r
+        JOIN best_seller.searches s ON s.id = r.search_id
+        LEFT JOIN best_seller.node_cache c ON c.marketplace = s.marketplace AND c.node = r.node
+        WHERE r.search_id = %s AND r.node = %s;
+        """, (search_id, node), fetch=True)
+    if not rows:
+        raise BestSellerStoreError("Подкатегория не найдена в этом поиске — обновите страницу.")
+    target, leader_bsr, k1, k2, badge = rows[0]
+    if not (k1 and k2 and target):
+        raise BestSellerStoreError("Релевантность оценивается только после К1 и К2.")
+    verdict = best_seller.evaluate(target, leader_bsr, best_seller.K2_REQUIRED_ITEMS, relevance, badge)
+    updated = _run(connect, """
+        UPDATE best_seller.search_results SET relevance = %s, k3 = %s, k4 = %s, status = %s, priority = %s, reason = %s
+        WHERE search_id = %s AND node = %s RETURNING node;
+        """, (relevance, verdict.k3, verdict.k4, verdict.status, verdict.priority, verdict.reason, search_id, node),
+                   fetch=True)
+    if not updated:
+        raise BestSellerStoreError("Оценка не сохранилась — попробуйте ещё раз.")
+    return verdict

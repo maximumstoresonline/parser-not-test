@@ -105,3 +105,47 @@ def test_not_needed_and_errors_and_first_time(monkeypatch):
     at, _ = start(monkeypatch, found=None)
     at.text_input(key="bs_link").set_value("https://www.amazon.com/dp/B0H9LK9T39").run(timeout=30)
     assert "поиска ещё не было" in page_text(at)
+
+
+TOP = [{"rank": 1, "asin": "B0AAAAAAA1", "title": "Straw Cowboy Hat for Men"},
+       {"rank": 2, "asin": "B0AAAAAAA2", "title": "Western Cowboy Hat <Brown>"}]
+
+
+def with_top(found=FOUND):
+    results = [dict(row, top=TOP if row["k1"] and row["k2"] else None, dept="fashion") for row in found["results"]]
+    return dict(found, results=results)
+
+
+def test_relevance_is_rated_by_hand_from_the_top_titles(monkeypatch):
+    saved = []
+    monkeypatch.setattr(store, "set_relevance", lambda c, sid, node, rel, actor_role: saved.append((sid, node, rel, actor_role)))
+    at, _ = start(monkeypatch, found=with_top())
+    at.text_input(key="bs_link").set_value("https://www.amazon.com/dp/B0H9LK9T39").run(timeout=30)
+    text = page_text(at)
+    assert "Оценка релевантности (К3)" in text and "Western Cowboy Hat <Brown>" in text
+    assert "https://www.amazon.com/gp/bestsellers/fashion/9057030011" in text
+    labels = [e.label for e in at.expander]
+    # обе подкатегории с пройденными К1 и К2, неоценённая сверху; отклонённая по К1 — нет
+    assert labels == ["Men's Novelty Cowboy Hats — не оценена", "Men's Novelty Sun Hats — релевантная"]
+    radio = at.radio(key="bs_rel_7_9057030011")
+    assert radio.value is None
+    assert at.button(key="bs_rel_save_7_9057030011").disabled
+    radio.set_value("semi").run(timeout=30)
+    at.button(key="bs_rel_save_7_9057030011").click().run(timeout=30)
+    assert not at.exception
+    assert saved == [(7, "9057030011", "semi", "editor")]
+    assert at.radio(key="bs_rel_7_9057034011").value == "relevant"
+
+
+def test_a_viewer_sees_the_top_but_cannot_rate(monkeypatch):
+    at, _ = start(monkeypatch, can_edit=False, found=with_top())
+    at.text_input(key="bs_link").set_value("https://www.amazon.com/dp/B0H9LK9T39").run(timeout=30)
+    assert at.radio(key="bs_rel_7_9057030011").disabled
+    assert not [b for b in at.button if b.key == "bs_rel_save_7_9057030011"]
+    assert "Оценивать может сотрудник с правом редактирования." in page_text(at)
+
+
+def test_without_saved_titles_the_amazon_link_is_suggested(monkeypatch):
+    at, _ = start(monkeypatch, found=dict(FOUND, results=[dict(r, top=None, dept=None) for r in FOUND["results"]]))
+    at.text_input(key="bs_link").set_value("https://www.amazon.com/dp/B0H9LK9T39").run(timeout=30)
+    assert "Заголовки топа не сохранены" in page_text(at)
