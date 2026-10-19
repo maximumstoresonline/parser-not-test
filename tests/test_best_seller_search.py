@@ -249,3 +249,78 @@ def test_search_with_branches_checks_leaves_and_keeps_the_path():
         ("302", "Men › Hats & Caps › Sun Hats", "отклонена по К1")]
     # страница подкатегории взята при обходе и повторно не запрашивается; «309» не открылась — в кандидаты не попала
     assert fake.urls.count(URL + "302") == 1
+
+
+def test_keyword_filter_drops_never_relevant_and_beanie_skips_from_the_sop():
+    names = ["Belts", "Hand Fans", "Hats & Caps", "Gloves & Mittens", "Keyrings, Keychains & Charms", "Balaclavas",
+             "Visors", "Skullies & Beanies", "Sunglasses & Eyewear Accessories"]
+    assert s.keyword_filter("Merino Wool Beanie", names) == ["Hats & Caps", "Gloves & Mittens", "Skullies & Beanies"]
+    # не шапка — балаклавы и козырьки не выкидываются (для гейтора балаклава релевантна)
+    assert "Balaclavas" in s.keyword_filter("Merino Neck Gaiter", names)
+    assert "Belts" not in s.keyword_filter("Merino Neck Gaiter", names)
+
+
+def test_season_sports():
+    assert "skiing" in s.season_sports(NOW) and "cycling" not in s.season_sports(NOW)
+    july = NOW.replace(month=7)
+    assert "cycling" in s.season_sports(july) and "skiing" not in s.season_sports(july)
+    assert "running" in s.season_sports(NOW) and "running" in s.season_sports(july)
+
+
+def test_a_seasonal_branch_opens_only_this_seasons_sports_on_its_first_level():
+    kids = [("601", "Airsoft"), ("602", "Winter Sports"), ("603", "Cycling"), ("604", "Ice Skating")]
+    pages = {URL + "600": bs_page("Sport Specific Clothing", top("RR", 5), siblings=kids)}
+    pages.update({URL + n: bs_page(name, top("AA", 5), siblings=kids) for n, name in kids})
+    fake = Fake(pages)
+    leaves, _ = s.walk_branches("US", [s.Branch("Sport", "fashion", "600", seasonal=True)], fetch_page=fake.fetch_page,
+                                cache=s.MemoryCache(), now=NOW)
+    assert [x.node for x in leaves] == ["602", "604"]  # сначала зимние, в порядке season_sports
+    assert URL + "601" not in fake.urls and URL + "603" not in fake.urls
+
+
+def test_next_page_link_is_not_a_subcategory():
+    page = bs_page("Hats", top("HH", 3), siblings=[("301", "Trapper Hats")]).replace(
+        "</body>", '<a href="/Best/zgbs/fashion/300/ref=zg_bs_pg_2_fashion?pg=2">Next page</a></body>')
+    assert [x.name for x in s.parse_bestsellers(page).linked] == ["Trapper Hats"]
+
+
+def test_candidates_are_taken_from_every_branch_in_turn():
+    leaves = [s.Subcategory(str(i), "fashion", f"A{i}", path=f"Men › A{i}") for i in range(3)] + \
+             [s.Subcategory(str(10 + i), "fashion", f"B{i}", path=f"Novelty › B{i}") for i in range(2)]
+    assert [x.node for x in s._interleaved(leaves)] == ["0", "10", "1", "11", "2"]
+
+
+def test_a_leader_page_without_bsr_is_asked_again():
+    pages = {URL + "302": bs_page("Men's Sun Hats", top("SS", 50))}
+    answers = iter(['<div id="zeitgeistBadge_feature_div"><span>#1 Best Seller</span></div>', leader_page(70000)])
+
+    def fetch(url):
+        return next(answers) if "/dp/" in url else pages.get(url)
+
+    info, used = s._check_node("US", s.Subcategory("302", "fashion", "Sun Hats"), fetch, s.MemoryCache(), 60000, NOW)
+    assert info.leader_bsr == 70000 and used == 4  # страница, лидер дважды, ?pg=2
+
+
+def test_keyword_filter_skips_exotic_apparel_and_kids_for_an_adult_product():
+    names = ["Exotic Apparel", "Men", "Women", "Boys", "Girls", "Baby"]
+    assert s.keyword_filter("Merino Wool Beanie for Women, Men", names) == ["Men", "Women"]
+    assert s.keyword_filter("Girls Ice Skating Pants", names) == ["Men", "Women", "Boys", "Girls", "Baby"]
+
+
+def test_our_page_without_bsr_is_asked_again():
+    answers = iter([{"title": "Merino Sun Hat", "best_sellers_rank": []}, PRODUCT])
+    fake = Fake({})
+    result = s.search(OURS, "US", fetch_product=lambda a, d: next(answers), fetch_page=fake.fetch_page,
+                      cache=s.MemoryCache(), now=NOW, max_candidates=1)
+    assert result.our_bsr == 90000 and len(result.own) == 2
+
+
+def test_seasonal_sports_go_first_and_beanies_skip_garments():
+    kids = [("701", "Hiking & Outdoor Recreation"), ("702", "Ice Skating"), ("703", "Running")]
+    pages = {URL + "700": bs_page("Sport", top("RR", 5), siblings=kids)}
+    pages.update({URL + n: bs_page(name, top("AA", 5), siblings=kids) for n, name in kids})
+    leaves, _ = s.walk_branches("US", [s.Branch("Sport", "fashion", "700", seasonal=True)],
+                                fetch_page=Fake(pages).fetch_page, cache=s.MemoryCache(), now=NOW)
+    assert [x.node for x in leaves] == ["702", "703", "701"]
+    assert s.keyword_filter("Merino Beanie", ["Pants", "Hoodies", "Accessories", "Hats"]) == ["Accessories", "Hats"]
+    assert "Pants" in s.keyword_filter("Merino Base Layer", ["Pants", "Hoodies"])

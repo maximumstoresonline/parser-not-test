@@ -67,3 +67,23 @@ def test_scrape_page_uses_the_generic_endpoint_and_hides_the_token(caplog):
     bad = TextSession(TextResponse(410, "timed out for key T"))
     assert scraping.scrape_page("https://x", token="T", session=bad) is None
     assert "timed out for key ***" in caplog.text and "key T" not in caplog.text
+
+
+class SequenceSession:
+    def __init__(self, *responses):
+        self.responses, self.calls = list(responses), []
+
+    def get(self, url, params, timeout):
+        self.calls.append(dict(params))
+        return self.responses.pop(0)
+
+
+def test_scrape_page_retries_once_in_stealth_mode_only_when_scrapingdog_suggests_it():
+    hint = "Oops! Something went wrong. You can try enabling Stealth Mode using stealth_mode=true."
+    session = SequenceSession(TextResponse(400, hint), TextResponse(200, "<html>ok</html>"))
+    assert scraping.scrape_page("https://x", token="T", session=session) == "<html>ok</html>"
+    assert "stealth_mode" not in session.calls[0] and session.calls[1]["stealth_mode"] == "true"
+    other = SequenceSession(TextResponse(400, "bad url"))
+    assert scraping.scrape_page("https://x", token="T", session=other) is None and len(other.calls) == 1
+    twice = SequenceSession(TextResponse(400, hint), TextResponse(400, hint))
+    assert scraping.scrape_page("https://x", token="T", session=twice) is None and len(twice.calls) == 2

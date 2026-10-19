@@ -48,11 +48,14 @@ class Subcategory:
 
 @dataclass(frozen=True)
 class Branch:
-    """Корень ветки дерева Best Sellers, которую обходит поиск (SOP-AMZ-001, шаги 4–7)."""
+    """Корень ветки дерева Best Sellers, которую обходит поиск (SOP-AMZ-001, шаги 4–7).
+    seasonal — на первом уровне открывать только виды спорта текущего сезона (шаг 6: «перебрать виды спорта
+    по сезону»)."""
 
     label: str
     dept: str
     node: str
+    seasonal: bool = False
 
 
 # Ветки из SOP для одежды и аксессуаров, Amazon US, в порядке обхода (Men → Women → Sport → Novelty).
@@ -60,8 +63,8 @@ class Branch:
 US_APPAREL_BRANCHES = (
     Branch("Men › Accessories › Hats & Caps", "fashion", "2474954011"),
     Branch("Women › Accessories", "fashion", "2474936011"),
-    Branch("Sport Specific Clothing", "fashion", "23575629011"),
-    Branch("Sports & Outdoors › Sports", "sporting-goods", "10971181011"),
+    Branch("Sport Specific Clothing", "fashion", "23575629011", seasonal=True),
+    Branch("Sports & Outdoors › Sports", "sporting-goods", "10971181011", seasonal=True),
     Branch("Novelty & More", "fashion", "7147445011"),
 )
 BRANCHES_BY_MARKET = {"US": US_APPAREL_BRANCHES}
@@ -69,6 +72,55 @@ MAX_PAGES_PER_BRANCH = 30  # страниц меню на ветку без от
 MAX_BRANCH_CANDIDATES = 40
 # (наш заголовок, названия подкатегорий уровня) -> названия, которые стоит открывать (отсев явно нерелевантных)
 NameFilter = Callable[[str, Sequence[str]], Sequence[str]]
+
+# Сезонность в SOP не описана (П10) — пока так: октябрь–март зима, апрель–сентябрь лето. Бег и походы — круглый год
+# (термобельё и носки из мерино в них релевантны в любой сезон). Сравнение — по вхождению слова в название узла.
+WINTER_MONTHS = (10, 11, 12, 1, 2, 3)
+ALL_SEASON_SPORTS = ("running", "hiking", "outdoor recreation")
+WINTER_SPORTS = ("winter sports", "skiing", "snowboarding", "ice skating", "ice hockey", "snowshoe", "sledding")
+SUMMER_SPORTS = ("cycling", "water sports", "boating", "golf", "tennis", "triathlon", "yoga", "climbing")
+
+# Подкатегории, которые для одежды и аксессуаров из мерино нерелевантны всегда: не открываются и не тратят запросы.
+NEVER_RELEVANT = ("airsoft", "hand fans", "handbag", "keyring", "keychain", "wallet", "card case", "money organizer",
+                  "belts", "sunglasses", "eyewear", "watches", "jewelry", "umbrella", "special occasion", "wigs",
+                  "exotic", "lingerie")  # Exotic Apparel в Novelty & More съела весь лимит страниц ветки (прогон 19.10)
+# Головные уборы, которые SOP велит пропускать для шапки-бини сразу (шаг 4: «Balaclavas, Visors»).
+HEADWEAR_WORDS = ("beanie", "hat", "cap", "skull")
+NOT_FOR_BEANIES = ("balaclavas", "visors")
+# Одежда, которую для головного убора открывать незачем: в Novelty › Men обход перебирал штаны и худи вместо
+# Accessories (прогон 19.10).
+GARMENTS = ("pants", "shorts", "swim", "hoodies", "sweatshirts", "dresses", "socks", "leggings", "jackets", "coats",
+            "vests", "shirts", "tops", "skirts", "jumpsuits", "underwear", "sleepwear", "pajama", "bras", "suits",
+            "shoes", "boots", "sweaters", "capris", "overalls", "rompers")
+# Детские подкатегории для взрослого товара не открываются: в Sport Specific Clothing они съедали лимит страниц до
+# Ice Skating (прогон 19.10). Находки для детских товаров (как Girls' Ice Skating в SOP) — их собственным поиском.
+KIDS_WORDS = ("boys", "girls", "baby", "toddler", "kids", "children", "youth")
+
+
+def season_sports(now: datetime) -> Tuple[str, ...]:
+    """Виды спорта сезона, сначала сезонные: при лимите страниц ветки до Ice Skating обход должен дойти раньше,
+    чем до круглогодичного Hiking (прогон 19.10)."""
+    return (WINTER_SPORTS if now.month in WINTER_MONTHS else SUMMER_SPORTS) + ALL_SEASON_SPORTS
+
+
+def _season_rank(name: str, sports: Sequence[str]) -> int:
+    return next((i for i, sport in enumerate(sports) if _has_word(name, (sport,))), len(sports))
+
+
+def _has_word(text: str, words: Sequence[str]) -> bool:
+    text = text.casefold()
+    return any(re.search(rf"\b{re.escape(word)}", text) for word in words)
+
+
+def keyword_filter(our_title: str, names: Sequence[str]) -> List[str]:
+    """Отсев по названию без ИИ: убирает заведомо нерелевантное (NEVER_RELEVANT), а для шапок — ещё и то, что SOP
+    велит пропускать. Сомнительное оставляет — его отсеет К1/К2 или К3."""
+    headwear = _has_word(our_title, HEADWEAR_WORDS)
+    adult = not _has_word(our_title, KIDS_WORDS)
+    return [name for name in names
+            if not _has_word(name, NEVER_RELEVANT)
+            and not (headwear and _has_word(name, NOT_FOR_BEANIES + GARMENTS))
+            and not (adult and _has_word(name, KIDS_WORDS))]
 
 
 @dataclass
@@ -186,7 +238,7 @@ def parse_bestsellers(page: str) -> BestsellersPage:
     # «‹ Women», «Hats & Caps») слишком общие — в кандидаты не берутся.
     for dept, node, ref, label in re.findall(
             r'href="[^"]*/zgbs/([a-z0-9-]+)/(\d+)(/ref=[^"]*)?"[^>]*>\s*([^<]{2,120}?)\s*<', page):
-        if "zg_bs_unv" in ref or not html_lib.unescape(label).strip():
+        if "zg_bs_unv" in ref or "zg_bs_pg" in ref or not html_lib.unescape(label).strip():
             continue
         if node not in seen:
             seen.add(node)
@@ -293,8 +345,15 @@ def search(asin: str, market: str, *, fetch_product: ProductFetch, fetch_page: P
         result.error = f"Неизвестная страна: {market}"
         return result
     domain = pairs_store.DOMAIN_BY_MARKET[market]
-    product = fetch_product(asin, domain)
-    result.requests += 1
+    # Страница товара иногда приходит без блока BSR (B0GNBSDL65, 19.10) — тогда без своих подкатегорий нельзя
+    # проверить «уже в топ-3»: запрашиваем ещё раз.
+    product = None
+    for _ in range(max(1, attempts)):
+        answer = fetch_product(asin, domain)
+        result.requests += 1
+        product = answer or product
+        if not answer or own_subcategories(answer)[0] is not None:  # пустой ответ уже повторён в _retrying
+            break
     if not product:
         result.error = "ScrapingDog не вернул карточку товара"
         return result
@@ -316,7 +375,7 @@ def search(asin: str, market: str, *, fetch_product: ProductFetch, fetch_page: P
         leaves, used = walk_branches(market, branches, fetch_page=fetch_page, cache=cache, now=now, keep=keep,
                                      our_title=result.title)
         result.requests += used
-        for leaf in leaves:
+        for leaf in _interleaved(leaves):
             if leaf.node not in seen:
                 seen.add(leaf.node)
                 queue.append(leaf)
@@ -337,6 +396,21 @@ def search(asin: str, market: str, *, fetch_product: ProductFetch, fetch_page: P
     result.candidates.sort(key=lambda c: next(i for i, v in enumerate(order) if v is c.verdict))
     result.status = "done"
     return result
+
+
+def _interleaved(leaves: Sequence[Subcategory]) -> List[Subcategory]:
+    """По очереди из каждой ветки: лимит кандидатов не должен целиком уходить на первую большую ветку (обход
+    16.10.2026: Airsoft и Hand Fans съели все 40 мест до Sport Specific Clothing и Novelty)."""
+    by_branch: Dict[str, List[Subcategory]] = {}
+    for leaf in leaves:
+        by_branch.setdefault(leaf.path.split(" › ")[0] if leaf.path else "", []).append(leaf)
+    queues = list(by_branch.values())
+    out: List[Subcategory] = []
+    while any(queues):
+        for queue in queues:
+            if queue:
+                out.append(queue.pop(0))
+    return out
 
 
 def _page_info(market: str, sub: Subcategory, fetch_page: PageFetch, cache: NodeCache,
@@ -362,7 +436,8 @@ def walk_branches(market: str, branches: Sequence[Branch], *, fetch_page: PageFe
                   max_pages: int = MAX_PAGES_PER_BRANCH) -> Tuple[List[Subcategory], int]:
     """Конечные подкатегории веток (SOP, шаги 4–7) с путём «Ветка › …». Узел конечный, если его меню показывает
     тех же соседей, что и уровень выше (у конечной подкатегории детей нет — Amazon показывает соседей).
-    keep — отсев явно нерелевантных по названию до трат (как «Balaclavas, Visors — пропускать сразу» в SOP)."""
+    keep — отсев явно нерелевантных по названию до трат (как «Balaclavas, Visors — пропускать сразу» в SOP).
+    У сезонной ветки на первом уровне открываются только виды спорта сезона (season_sports)."""
     leaves: List[Subcategory] = []
     used = 0
     seen: set = set()
@@ -383,6 +458,9 @@ def walk_branches(market: str, branches: Sequence[Branch], *, fetch_page: PageFe
             if not kids:
                 leaves.append(Subcategory(sub.node, sub.dept, info.name or sub.name, path=path))
                 continue
+            if branch.seasonal and sub.node == branch.node:
+                sports = season_sports(now)
+                kids = sorted((k for k in kids if _has_word(k.name, sports)), key=lambda k: _season_rank(k.name, sports))
             if keep is not None:
                 allowed = set(keep(our_title, [k.name for k in kids]))
                 kids = [k for k in kids if k.name in allowed]
@@ -397,12 +475,18 @@ def _check_node(market: str, sub: Subcategory, fetch_page: PageFetch, cache: Nod
     info, used = _page_info(market, sub, fetch_page, cache, now)
     if info is None:
         return None, used
-    if info.leader_asin and info.leader_bsr is None and info.leader_badge is None:
+    # Страница лидера иногда приходит неполной (без блока BSR) — тогда она запрашивается ещё раз, а не
+    # остаётся «нужен BSR лидера» на неделю кэша (Men's Trapper Hats, 16.10.2026).
+    for _ in range(ATTEMPTS if info.leader_asin and info.leader_bsr is None else 0):
         leader = fetch_page(product_url(market, info.leader_asin))
         used += 1
         if leader:
-            info.leader_bsr, info.leader_badge = parse_leader(leader)
-            cache.put(market, info)
+            bsr, badge = parse_leader(leader)
+            info.leader_badge = badge if badge is not None else info.leader_badge
+            if bsr is not None:
+                info.leader_bsr = bsr
+                cache.put(market, info)
+                break
     k1 = best_seller.evaluate(target_bsr, info.leader_bsr).k1
     if k1 and info.item_count is None:
         page = fetch_page(bestsellers_url(market, sub, 2))
