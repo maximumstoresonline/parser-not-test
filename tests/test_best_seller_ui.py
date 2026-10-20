@@ -53,7 +53,7 @@ def test_single_asin_page_matches_the_mockup():
     assert not at.exception
     text = page_text(at)
     for expected in ("Поиск подкатегорий Best Seller", "91 233", "61 496 – 101 435", "55 000 – 60 000", "#166 · #191",
-                     "Подходят: 2", "Отклонены: 3", "×7,7", "×0,006", "отклонена по К1", "Выбрано: 1"):
+                     "Подходят: 2", "Отклонены: 3", "×7,7", "×0,006", "сильнее порога К1", "Выбрано: 1"):
         assert expected in text, expected
     # Выбрать можно только подходящие подкатегории; по умолчанию отмечена та, что с высоким приоритетом.
     picks = [c for c in at.checkbox if c.key.startswith("bs_pick_")]

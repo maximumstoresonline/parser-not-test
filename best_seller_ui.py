@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from html import escape
 from typing import List, Optional, Sequence, Tuple
@@ -54,6 +55,8 @@ class Subcategory:
     item_count: Optional[int] = None
     relevance: Optional[str] = None
     leader_badge: Optional[bool] = None
+    dept: Optional[str] = None  # раздел Best Sellers в ссылке (/gp/bestsellers/<dept>/<node>)
+    leader_asin: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -147,6 +150,8 @@ _CSS = """
 .bs-table td { padding:.6rem .5rem; border-bottom:1px solid #eef2f7; color:#111827; }
 .bs-table td.bs-num, .bs-table th.bs-num { text-align:right; }
 .bs-asin { color:#0f4c75; font-weight:650; text-decoration:underline; }
+.bs-link { color:#0f4c75; text-decoration:underline; }
+.bs-hint { color:#334155; font-size:.84rem; margin:.5rem 0 .2rem; }
 .bs-progress-head { display:flex; justify-content:space-between; gap:1rem; flex-wrap:wrap; }
 .bs-bar { height:8px; background:#e5e7eb; border-radius:999px; overflow:hidden; margin:.6rem 0 .2rem; }
 .bs-bar > div { height:100%; background:#0f4c75; border-radius:999px; }
@@ -242,6 +247,58 @@ _PRIORITY_CSS = {best_seller.HIGH: "bs-high", best_seller.LOW: "bs-low", best_se
 _STATUS_CSS = {"готово": "bs-ok", "поиск не нужен": "bs-muted", "ошибка запроса": "bs-error", "в очереди": "bs-warn"}
 
 
+# Ссылки строятся из данных, сохранённых со страниц Amazon, поэтому каждая часть проверяется по шаблону.
+_SAFE_DEPT = re.compile(r"^[a-z0-9-]+$")
+_SAFE_NODE = re.compile(r"^\d+$")
+_SAFE_ASIN = re.compile(r"^[A-Z0-9]{10}$")
+
+
+def node_url(domain: Optional[str], dept: Optional[str], node: Optional[str]) -> Optional[str]:
+    """Страница Best Sellers подкатегории на Amazon или None, если не хватает данных / они не похожи на настоящие."""
+    if not domain or not dept or not node or not _SAFE_DEPT.match(dept) or not _SAFE_NODE.match(node):
+        return None
+    return f"https://www.amazon.{domain}/gp/bestsellers/{dept}/{node}"
+
+
+def asin_url(domain: Optional[str], asin: Optional[str]) -> Optional[str]:
+    if not domain or not asin or not _SAFE_ASIN.match(asin):
+        return None
+    return f"https://www.amazon.{domain}/dp/{asin}"
+
+
+def _link(text: str, url: Optional[str], css: str = "bs-link") -> str:
+    if not url:
+        return escape(text)
+    return f'<a class="{css}" href="{escape(url)}" target="_blank" rel="noopener noreferrer">{escape(text)}</a>'
+
+
+def explain_rejection(verdict: best_seller.Verdict, leader_bsr: Optional[int], target: Optional[int]) -> str:
+    """Почему подкатегория отклонена, словами и с числами. К1 — единственный критерий, который зависит от целевого
+    BSR: у него объясняем, при каком условии подкатегория прошла бы. Остальные отказы — текст из правил."""
+    if verdict.status != best_seller.REJECTED or verdict.k1 is not False or leader_bsr is None or not target:
+        return verdict.reason
+    if leader_bsr < best_seller.K1_MIN_LEADER_BSR:
+        return (f"лидер на {fmt_int(leader_bsr)} — сильнее порога К1 ({fmt_int(best_seller.K1_MIN_LEADER_BSR)}), "
+                "при любой цели не пройдёт")
+    return f"лидер на {fmt_int(leader_bsr)}, цель {fmt_int(target)}: пройдёт при цели ниже {fmt_int(leader_bsr)}"
+
+
+def no_match_hint(evaluated: Sequence[Tuple[Subcategory, best_seller.Verdict]]) -> Optional[str]:
+    """Подсказка, когда подходящих нет, а все отказы — по К1: что менять в целевом BSR (и можно ли вообще)."""
+    if any(v.status != best_seller.REJECTED for _, v in evaluated):
+        return None
+    failed = [sub for sub, v in evaluated if v.k1 is False]
+    if not failed or len(failed) != len(evaluated):
+        return None
+    floor = best_seller.K1_MIN_LEADER_BSR
+    weak = [sub.leader_bsr for sub in failed if sub.leader_bsr is not None and sub.leader_bsr >= floor]
+    if not weak:
+        return (f"Подходящих нет. У всех найденных подкатегорий лидер сильнее порога К1 ({fmt_int(floor)}): "
+                "при любом целевом BSR К1 не пройти.")
+    return (f"Подходящих нет. Подкатегория с самым слабым лидером прошла бы К1 при целевом BSR ниже {fmt_int(max(weak))}. "
+            f"У остальных лидер сильнее порога {fmt_int(floor)}, им цель не поможет.")
+
+
 def _mark(value: Optional[bool]) -> str:
     if value is None:
         return '<span class="bs-dash">–</span>'
@@ -282,9 +339,17 @@ def _listing_card(listing: Listing) -> str:
 
 
 _COLS = [0.45, 3.3, 1.6, 1.05, 1.15, 0.38, 0.38, 0.38, 0.38, 1.5]
+# Пока ни у одной подкатегории не проверялись К2–К4 (все отклонены по К1), эти колонки были бы сплошь «–»:
+# вместо них — одна широкая колонка с причиной отказа.
+_COLS_SHORT = [0.45, 3.4, 1.1, 1.2, 0.4, 3.6]
 
 
-def _results(key: str, evaluated: List[Tuple[Subcategory, best_seller.Verdict]]) -> None:
+def _results(key: str, evaluated: List[Tuple[Subcategory, best_seller.Verdict]], domain: Optional[str] = None,
+             target: Optional[int] = None) -> None:
+    """domain — домен Amazon страны поиска (ca, com, de…): по нему названия подкатегорий и ASIN лидеров становятся
+    ссылками. target — целевой BSR: нужен, чтобы объяснить отказ по К1 числами."""
+    deep = any(v.k2 is not None or v.k3 is not None or v.k4 is not None or v.status == best_seller.SUITABLE
+               for _, v in evaluated)
     suitable = sum(v.status == best_seller.SUITABLE for _, v in evaluated)
     rejected = sum(v.status == best_seller.REJECTED for _, v in evaluated)
     pending = sum(v.status == best_seller.PENDING for _, v in evaluated)
@@ -297,34 +362,56 @@ def _results(key: str, evaluated: List[Tuple[Subcategory, best_seller.Verdict]])
             f'{_pill(f"Отклонены: {rejected}", "bs-muted")}</div>',
             unsafe_allow_html=True,
         )
-        header = ["", "Подкатегория", "Релевантность", "BSR лидера", "Лидер / наша цель", "К1", "К2", "К3", "К4",
-                  "Приоритет"]
-        for col, title in zip(st.columns(_COLS), header):
+        if deep:
+            layout = _COLS
+            header = ["", "Подкатегория", "Релевантность", "BSR лидера", "Лидер / наша цель", "К1", "К2", "К3", "К4",
+                      "Приоритет"]
+        else:
+            layout = _COLS_SHORT
+            header = ["", "Подкатегория", "BSR лидера", "Лидер / наша цель", "К1", "Почему отклонена"]
+        for col, title in zip(st.columns(layout), header):
             css = "bs-th bs-num" if title in ("BSR лидера", "Лидер / наша цель") else "bs-th"
             col.markdown(f'<div class="{css}">{escape(title)}</div>', unsafe_allow_html=True)
         selected = 0
         for index, (sub, verdict) in enumerate(evaluated):
-            cols = st.columns(_COLS, vertical_alignment="center")
+            cols = st.columns(layout, vertical_alignment="center")
             ok = verdict.status == best_seller.SUITABLE
             if cols[0].checkbox(sub.name, value=ok and verdict.priority == best_seller.HIGH, disabled=not ok,
                                 key=f"bs_pick_{key}_{sub.node}", label_visibility="collapsed"):
                 selected += ok
             cols[1].markdown(
-                f'<div class="bs-name">{escape(sub.name)}</div>'
+                f'<div class="bs-name">{_link(sub.name, node_url(domain, sub.dept, sub.node))}</div>'
                 f'<div class="bs-sub">{escape(" · ".join(x for x in (sub.path, sub.node) if x))}</div>',
                 unsafe_allow_html=True,
             )
-            relevance = (_pill(best_seller.RELEVANCE_LABELS[sub.relevance], _RELEVANCE_CSS.get(sub.relevance, "bs-muted"))
-                         if verdict.k3 else '<span class="bs-dash">–</span>')
-            cols[2].markdown(relevance, unsafe_allow_html=True)
-            cols[3].markdown(f'<div class="bs-num"><b>{fmt_int(sub.leader_bsr)}</b></div>', unsafe_allow_html=True)
-            cols[4].markdown(f'<div class="bs-num">{fmt_ratio(verdict.leader_to_target)}</div>', unsafe_allow_html=True)
-            for col, value in zip(cols[5:9], (verdict.k1, verdict.k2, verdict.k3, verdict.k4)):
-                col.markdown(_mark(value), unsafe_allow_html=True)
-            if ok:
-                cols[9].markdown(_pill(verdict.priority, _PRIORITY_CSS[verdict.priority]), unsafe_allow_html=True)
+            leader = f'<div class="bs-num"><b>{fmt_int(sub.leader_bsr)}</b></div>'
+            leader_link = asin_url(domain, sub.leader_asin)
+            if leader_link:
+                leader += f'<div class="bs-sub bs-num">лидер {_link(sub.leader_asin, leader_link)}</div>'
+            reason = explain_rejection(verdict, sub.leader_bsr, target)
+            if deep:
+                relevance = (_pill(best_seller.RELEVANCE_LABELS[sub.relevance],
+                                   _RELEVANCE_CSS.get(sub.relevance, "bs-muted"))
+                             if verdict.k3 else '<span class="bs-dash">–</span>')
+                cols[2].markdown(relevance, unsafe_allow_html=True)
+                cols[3].markdown(leader, unsafe_allow_html=True)
+                cols[4].markdown(f'<div class="bs-num">{fmt_ratio(verdict.leader_to_target)}</div>',
+                                 unsafe_allow_html=True)
+                for col, value in zip(cols[5:9], (verdict.k1, verdict.k2, verdict.k3, verdict.k4)):
+                    col.markdown(_mark(value), unsafe_allow_html=True)
+                if ok:
+                    cols[9].markdown(_pill(verdict.priority, _PRIORITY_CSS[verdict.priority]), unsafe_allow_html=True)
+                else:
+                    cols[9].markdown(f'<span class="bs-rejected">{escape(reason)}</span>', unsafe_allow_html=True)
             else:
-                cols[9].markdown(f'<span class="bs-rejected">{escape(verdict.reason)}</span>', unsafe_allow_html=True)
+                cols[2].markdown(leader, unsafe_allow_html=True)
+                cols[3].markdown(f'<div class="bs-num">{fmt_ratio(verdict.leader_to_target)}</div>',
+                                 unsafe_allow_html=True)
+                cols[4].markdown(_mark(verdict.k1), unsafe_allow_html=True)
+                cols[5].markdown(f'<span class="bs-rejected">{escape(reason)}</span>', unsafe_allow_html=True)
+        hint = no_match_hint(evaluated) if not suitable else None
+        if hint:
+            st.markdown(f'<div class="bs-hint">{escape(hint)}</div>', unsafe_allow_html=True)
         button, note = st.columns([1.3, 3], vertical_alignment="center")
         _soon(button, "Записать выбранные в таблицу гипотез", "bs_write_one", WRITE_LATER, disabled=not selected)
         note.markdown(f'<span class="bs-meta">Выбрано: {selected} → Google-таблица «{escape(SHEET_NAME)}»</span>',
@@ -363,7 +450,7 @@ def _render_demo_single() -> None:
         elif link.strip():
             st.warning(LINK_HINT)
     st.markdown(_listing_card(DEMO_LISTING), unsafe_allow_html=True)
-    _results(DEMO_LISTING.asin, evaluate_demo(DEMO_LISTING, DEMO_SUBCATEGORIES))
+    _results(DEMO_LISTING.asin, evaluate_demo(DEMO_LISTING, DEMO_SUBCATEGORIES), target=DEMO_LISTING.target[1])
     _legend()
     _demo_note(
         "Пример из макета: данные листинга — из ответа Scrapingdog по B0GNBSDL65 и истории BSR за 30 дней, "
@@ -428,7 +515,7 @@ def _found_pairs(found: dict) -> List[Tuple[Subcategory, best_seller.Verdict]]:
     for row in found["results"]:
         ratio = row["leader_bsr"] / target if row["leader_bsr"] and target else None
         sub = Subcategory(row["name"] or row["node"], row.get("path") or "", row["node"], row["leader_bsr"],
-                          relevance=row["relevance"])
+                          relevance=row["relevance"], dept=row.get("dept"), leader_asin=row.get("leader_asin"))
         pairs.append((sub, best_seller.Verdict(row["k1"], row["k2"], row["k3"], row["k4"], row["status"],
                                                row["priority"], ratio, row["reason"])))
     return pairs
@@ -486,7 +573,8 @@ def _render_single(connect=None, actor: str = "", can_edit: bool = False, token:
     if not found["results"]:
         st.info("Подкатегорий для проверки не нашлось.")
         return
-    _results(f"{found['market']}_{found['asin']}", _found_pairs(found))
+    _results(f"{found['market']}_{found['asin']}", _found_pairs(found),
+             domain=pairs_store.DOMAIN_BY_MARKET.get(found["market"]), target=found.get("target_bsr"))
     _legend()
     _relevance_review(connect, found, can_edit)
 

@@ -218,14 +218,14 @@ def latest_search(connect: Connect, market: str, asin: str) -> Optional[dict]:
     # стоит в топе»). Берутся только там, где К3 вообще оценивается (К1 и К2 пройдены).
     results = _run(connect, """
         SELECT r.node, r.name, r.path, r.leader_bsr, r.k1, r.k2, r.k3, r.k4, r.relevance, r.status, r.priority,
-               r.reason, CASE WHEN r.k1 AND r.k2 THEN c.top END, c.dept
+               r.reason, CASE WHEN r.k1 AND r.k2 THEN c.top END, c.dept, c.leader_asin
         FROM best_seller.search_results r
         LEFT JOIN best_seller.node_cache c ON c.marketplace = %s AND c.node = r.node
         WHERE r.search_id = %s
         ORDER BY CASE r.status WHEN 'suitable' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END, r.leader_bsr DESC NULLS LAST;
         """, (market, sid), fetch=True)
     keys = ("node", "name", "path", "leader_bsr", "k1", "k2", "k3", "k4", "relevance", "status", "priority", "reason",
-            "top", "dept")
+            "top", "dept", "leader_asin")
     return {"id": sid, "market": market, "asin": asin, "title": title, "our_bsr": our, "target_bsr": target,
             "status": status, "error": error, "own": list(own or []), "requests": requests, "actor": actor,
             "finished_at": finished, "results": [dict(zip(keys, row)) for row in results]}

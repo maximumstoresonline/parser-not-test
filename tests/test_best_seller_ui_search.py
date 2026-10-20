@@ -77,7 +77,7 @@ def test_saved_result_is_shown_instead_of_the_mockup(monkeypatch):
     at.text_input(key="bs_link").set_value("https://www.amazon.com/dp/B0H9LK9T39").run(timeout=30)
     text = page_text(at)
     for expected in ("Classic Straw Hat", "859 857", "60 000", "#8 · #12", "запросов ScrapingDog: 13",
-                     "Подходят: 1", "Ждут проверки: 1", "Отклонены: 1", "×7,1", "отклонена по К1",
+                     "Подходят: 1", "Ждут проверки: 1", "Отклонены: 1", "×7,1", "сильнее порога К1",
                      "нужна оценка релевантности"):
         assert expected in text, expected
     assert "×7,7" not in text  # не пример из макета
@@ -149,3 +149,44 @@ def test_without_saved_titles_the_amazon_link_is_suggested(monkeypatch):
     at, _ = start(monkeypatch, found=dict(FOUND, results=[dict(r, top=None, dept=None) for r in FOUND["results"]]))
     at.text_input(key="bs_link").set_value("https://www.amazon.com/dp/B0H9LK9T39").run(timeout=30)
     assert "Заголовки топа не сохранены" in page_text(at)
+
+
+# Реальный случай 20.10.2026: B07WNVSKJ9 в Канаде, цель = текущий BSR, у обоих лидеров BSR намного лучше цели.
+CA_ALL_REJECTED = {
+    **FOUND, "market": "CA", "asin": "B07WNVSKJ9", "our_bsr": 425109, "target_bsr": 425109,
+    "results": [
+        {"node": "121178006011", "name": "The most popular items in Men's Undershirt Tank Tops", "leader_bsr": 6487,
+         "k1": False, "k2": None, "k3": None, "k4": None, "relevance": None, "status": "rejected", "priority": None,
+         "reason": "отклонена по К1", "dept": "apparel", "leader_asin": "B0AAAAAAA1"},
+        {"node": "121178005011", "name": "The most popular items in Men's Undershirt Tees", "leader_bsr": 1443,
+         "k1": False, "k2": None, "k3": None, "k4": None, "relevance": None, "status": "rejected", "priority": None,
+         "reason": "отклонена по К1", "dept": "apparel", "leader_asin": "B0AAAAAAA2"},
+    ],
+}
+
+
+def test_all_rejected_search_has_links_reasons_and_a_hint_without_empty_columns(monkeypatch):
+    at, _ = start(monkeypatch, found=CA_ALL_REJECTED)
+    at.text_input(key="bs_link").set_value("https://www.amazon.ca/dp/B07WNVSKJ9").run(timeout=30)
+    assert not at.exception
+    html = " ".join(m.value for m in at.markdown)
+    # подкатегория и лидер — ссылки на Amazon Канады
+    assert 'href="https://www.amazon.ca/gp/bestsellers/apparel/121178006011"' in html
+    assert 'href="https://www.amazon.ca/dp/B0AAAAAAA1"' in html
+    # причина с числами и подсказка про цель
+    text = page_text(at)
+    assert "лидер на 6 487" in text and "при любой цели не пройдёт" in text
+    assert "Подходящих нет" in text and "при любом целевом BSR К1 не пройти" in text
+    # пустые колонки К2–К4 и «Релевантность» не рисуются, есть колонка с причиной
+    assert '>Почему отклонена</div>' in html
+    for header in ("Релевантность", "К2", "К3", "К4", "Приоритет"):
+        assert f'>{header}</div>' not in html
+
+
+def test_search_with_a_suitable_row_keeps_the_full_table_and_has_no_hint(monkeypatch):
+    at, _ = start(monkeypatch)
+    at.text_input(key="bs_link").set_value("https://www.amazon.com/dp/B0H9LK9T39").run(timeout=30)
+    html = " ".join(m.value for m in at.markdown)
+    text = page_text(at)
+    assert '>Релевантность</div>' in html and '>Приоритет</div>' in html
+    assert "Подходящих нет" not in text
