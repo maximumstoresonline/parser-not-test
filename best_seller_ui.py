@@ -566,6 +566,10 @@ def _render_single(connect=None, actor: str = "", can_edit: bool = False, token:
     if found["status"] == "error":
         st.error(f"Поиск не удался: {found['error'] or 'нет ответа ScrapingDog'}. Попробуйте ещё раз.")
         return
+    if found["status"] in ("queued", "running"):
+        st.info("Поиск по этому ASIN " + ("идёт" if found["status"] == "running" else "стоит в очереди")
+                + " (запущен из режима «Список ASIN»). Результат появится здесь, когда воркер закончит: обновите страницу.")
+        return
     st.markdown(_real_listing_card(found), unsafe_allow_html=True)
     if found["status"] == "not_needed":
         st.success("Товар уже в топ-3 своей подкатегории — новая подкатегория не нужна (шаг 2 SOP).")
@@ -768,7 +772,135 @@ def _render_watchlist(connect, actor: str, can_edit: bool) -> None:
             _watch_manage(connect, rows, problem, actor, can_edit)
 
 
-def _render_batch(connect=None, actor: str = "", can_edit: bool = False) -> None:
+_STATUS_LABELS = {"queued": "в очереди", "running": "идёт поиск", "done": "готово", "not_needed": "поиск не нужен",
+                  "error": "ошибка запроса"}
+
+
+def batch_row_from_db(row: dict) -> BatchRow:
+    """Строка таблицы списка из последнего поиска по ASIN (best_seller_store.batch_rows)."""
+    status = _STATUS_LABELS.get(row["status"], "ещё не искали")
+    best = None
+    if row["status"] == "not_needed":
+        best = "уже в топ-3 своей подкатегории"
+    elif row["status"] == "done":
+        best = row["best"] or "нет подходящих"
+    elif row["status"] == "error":
+        best = row["error"] or None
+    return BatchRow(row["asin"], row["market"], "", fmt_int(row["our_bsr"]) if row["our_bsr"] else None, best,
+                    row["leader_bsr"], row["suitable"] if row["status"] == "done" else None, row["priority"], status)
+
+
+def batch_counts(rows: Sequence[BatchRow]) -> Tuple[int, int, int, int, int]:
+    """(обработано, с подходящими, без подходящих, ошибок, в работе) по строкам таблицы."""
+    done = sum(r.status in ("готово", "поиск не нужен", "ошибка запроса") for r in rows)
+    with_ = sum(r.status == "готово" and bool(r.suitable) for r in rows)
+    without = sum(r.status == "готово" and not r.suitable for r in rows)
+    errors = sum(r.status == "ошибка запроса" for r in rows)
+    active = sum(r.status in ("в очереди", "идёт поиск") for r in rows)
+    return done, with_, without, errors, active
+
+
+def batch_csv(rows: Sequence[BatchRow]) -> str:
+    import csv
+    import io
+
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow(["ASIN", "Страна", "Наш BSR", "Лучшая подкатегория", "BSR лидера", "Подходят", "Приоритет",
+                     "Статус"])
+    for r in rows:
+        writer.writerow([r.asin, r.market, r.our_bsr or "", r.best or "", r.leader_bsr or "",
+                         "" if r.suitable is None else r.suitable, r.priority or "", r.status])
+    return out.getvalue()
+
+
+def _batch_ready(connect) -> bool:
+    if connect is None:
+        return False
+    try:
+        return best_seller_store.table_exists(connect) and best_seller_store.search_tables_exist(connect)
+    except best_seller_store.BestSellerStoreError:
+        return False
+
+
+def _start_batch(connect, actor: str, can_edit: bool, dispatch_token: str, repo: str, only_new: bool) -> None:
+    try:
+        queued = best_seller_store.enqueue_searches(connect, actor_role=best_seller_role(can_edit), actor=actor,
+                                                    only_new=only_new)
+    except (best_seller_store.BestSellerStoreError, access.AccessDenied) as exc:
+        st.error(str(exc))
+        return
+    if not queued:
+        st.info("Поставить нечего: все активные ASIN уже в очереди или по ним есть результат. "
+                "Чтобы искать заново, снимите галочку «Только без результата».")
+        return
+    import github_dispatch
+
+    sent = github_dispatch.dispatch_batch_search(dispatch_token, repo or github_dispatch.DEFAULT_REPO)
+    if sent.ok:
+        st.session_state["bs_batch_flash"] = (f"В очередь поставлено {queued} ASIN, поиск запущен в GitHub Actions. "
+                                              "Результаты появятся здесь, нажимайте «Обновить».")
+        st.rerun()
+    else:
+        st.warning(f"В очередь поставлено {queued} ASIN, но запустить воркер не удалось: {sent.message} "
+                   "Его можно запустить вручную: GitHub → Actions → «Best Seller — поиск по списку».")
+
+
+def _render_batch_live(connect, actor: str, can_edit: bool, dispatch_token: str, repo: str) -> None:
+    flash = st.session_state.pop("bs_batch_flash", None)
+    if flash:
+        st.success(flash)
+    run_col, only_col, refresh_col = st.columns([1, 1.6, 1], vertical_alignment="center")
+    only_new = only_col.checkbox("Только без результата", value=True, key="bs_batch_only_new",
+                                 help="Не искать заново ASIN, по которым уже есть готовый результат: так не тратятся "
+                                      "кредиты ScrapingDog.")
+    if run_col.button("Запустить поиск", key="bs_batch_run", type="primary", disabled=not can_edit):
+        _start_batch(connect, actor, can_edit, dispatch_token, repo, only_new)
+    refresh_col.button("Обновить", key="bs_batch_refresh")
+    if not can_edit:
+        st.caption("Запускать поиск может сотрудник с правом редактирования.")
+    try:
+        rows = [batch_row_from_db(r) for r in best_seller_store.batch_rows(connect)]
+    except best_seller_store.BestSellerStoreError as exc:
+        st.error(str(exc))
+        return
+    if not rows:
+        st.info("В списке пока нет активных ASIN: добавьте их выше.")
+        return
+    done, with_, without, errors, active = batch_counts(rows)
+    total = len(rows)
+    with st.container(border=True):
+        st.markdown(
+            f'<div class="bs-progress-head"><span class="bs-progress-title">Обработано {done} из {total}</span>'
+            f'<span class="bs-meta">в очереди или идёт поиск: {active}</span></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="bs-bar"><div style="width:{done / total:.1%}"></div></div>', unsafe_allow_html=True)
+        tiles = "".join(
+            f'<div class="bs-tile"><div class="bs-tile-label">{escape(label)}</div>'
+            f'<div class="bs-tile-value" style="color:{color}">{count}</div></div>'
+            for label, count, color in (("С подходящими", with_, "#15803d"), ("Без подходящих", without, "#111827"),
+                                        ("Ошибки", errors, "#b91c1c")))
+        st.markdown(f'<div class="bs-tiles" style="margin-top:.3rem">{tiles}</div>', unsafe_allow_html=True)
+    with st.container(border=True):
+        search_col, status_col = st.columns([1.2, 3.8], vertical_alignment="bottom")
+        query = search_col.text_input("Поиск по ASIN", placeholder="B0…", key="bs_batch_query")
+        status = status_col.radio("Показать", STATUS_FILTERS, horizontal=True, key="bs_batch_status",
+                                  label_visibility="collapsed")
+        shown = filter_batch(rows, query, "Все группы", status)
+        if shown:
+            st.markdown(_batch_table(shown), unsafe_allow_html=True)
+        else:
+            st.info("Под фильтр ничего не подходит.")
+        st.download_button("Выгрузить в CSV", batch_csv(shown), file_name="best_seller_search.csv",
+                           mime="text/csv", key="bs_batch_csv_out", disabled=not shown)
+    st.markdown(
+        '<p class="bs-legend">Подробный результат по ASIN (подкатегории и критерии К1–К4) — в режиме «Один ASIN»: '
+        'введите тот же ASIN, там покажется последний поиск. Если ASIN уже в топ-3 своей подкатегории, поиск не '
+        'нужен (шаг 2 SOP). Запросы к Amazon тратятся на новые подкатегории, а не на каждый ASIN: топы хранятся '
+        'неделю.</p>', unsafe_allow_html=True)
+
+
+def _render_batch(connect=None, actor: str = "", can_edit: bool = False, dispatch_token: str = "",
+                  repo: str = "") -> None:
     st.markdown('<p class="section-title">Поиск подкатегорий: список ASIN</p>', unsafe_allow_html=True)
     st.markdown(
         '<p class="section-note">Один поиск на много ASIN. Топ-100 каждой подкатегории берётся один раз и хранится '
@@ -776,6 +908,11 @@ def _render_batch(connect=None, actor: str = "", can_edit: bool = False) -> None
         unsafe_allow_html=True,
     )
     _render_watchlist(connect, actor, can_edit)
+    if _batch_ready(connect):
+        _render_batch_live(connect, actor, can_edit, dispatch_token, repo)
+        return
+    st.info("Таблиц поиска в базе ещё нет (best_seller_db/002_search.sql) или база не подключена: ниже пример из "
+            "макета.")
     run_col, csv_col, _ = st.columns([1, 1, 2])
     _soon(run_col, "Запустить поиск", "bs_batch_run")
     _soon(csv_col, "Загрузить CSV", "bs_batch_csv")
@@ -826,14 +963,15 @@ def _render_batch(connect=None, actor: str = "", can_edit: bool = False) -> None
     )
 
 
-def render(connect=None, actor: str = "", can_edit: bool = False, token: str = "") -> None:
+def render(connect=None, actor: str = "", can_edit: bool = False, token: str = "", dispatch_token: str = "",
+           repo: str = "") -> None:
     """connect — подключение к базе дашборда (таблицы раздела — в схеме best_seller; None — нет базы);
     can_edit — может ли менять список."""
     st.markdown(_CSS, unsafe_allow_html=True)
-    st.info("Раздел в разработке: поиск по одному товару работает, поиск по списку и запись в таблицу гипотез — "
-            "следующими шагами.")
+    st.info("Раздел в разработке: поиск по одному ASIN и по списку работают, запись в таблицу гипотез — "
+            "следующим шагом.")
     mode = st.radio("Режим", MODES, horizontal=True, key="bs_mode", label_visibility="collapsed")
     if mode == MODES[0]:
         _render_single(connect, actor, can_edit, token)
     else:
-        _render_batch(connect, actor, can_edit)
+        _render_batch(connect, actor, can_edit, dispatch_token, repo)

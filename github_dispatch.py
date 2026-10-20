@@ -8,8 +8,9 @@ from typing import Callable, Optional
 
 import requests
 
-DEFAULT_REPO = "arseniborulko-bit/parser-not-test"
+DEFAULT_REPO = "maximumstoresonline/parser-not-test"  # репозиторий перенесён в организацию 19.10.2026
 DEFAULT_WORKFLOW = "collect.yml"
+BATCH_WORKFLOW = "best_seller_batch.yml"
 DEFAULT_REF = "main"
 SCOPES = ("all", "ours", "competitors")
 
@@ -45,6 +46,26 @@ def dispatch_collection(token: Optional[str], repo: str = DEFAULT_REPO, *, workf
         return DispatchResult(False, "Некорректное имя репозитория, workflow или ветки.")
     if scope not in SCOPES:
         return DispatchResult(False, "Некорректная область сбора.")
+    inputs = {}
+    if scope != "all":
+        inputs["scope"] = scope
+    if force:
+        inputs["force"] = True
+    return _dispatch(token, repo, workflow, ref, inputs, post, timeout)
+
+
+def dispatch_batch_search(token: Optional[str], repo: str = DEFAULT_REPO, *, ref: str = DEFAULT_REF,
+                          post: Optional[Callable] = None, timeout: float = 20) -> DispatchResult:
+    """Просит GitHub запустить воркер поиска подкатегорий по очереди (best_seller_batch.yml)."""
+    if not token:
+        return DispatchResult(False, "Не задан токен GitHub (секрет GITHUB_DISPATCH_TOKEN).")
+    if not (_REPO_RE.match(repo or "") and _REF_RE.match(ref or "")):
+        return DispatchResult(False, "Некорректное имя репозитория или ветки.")
+    return _dispatch(token, repo, BATCH_WORKFLOW, ref, {}, post, timeout)
+
+
+def _dispatch(token: str, repo: str, workflow: str, ref: str, inputs: dict, post: Optional[Callable],
+              timeout: float) -> DispatchResult:
     url = f"https://api.github.com/repos/{repo}/actions/workflows/{workflow}/dispatches"
     headers = {
         "Authorization": f"Bearer {token}",
@@ -52,11 +73,6 @@ def dispatch_collection(token: Optional[str], repo: str = DEFAULT_REPO, *, workf
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "parser-not-test-dashboard",
     }
-    inputs = {}
-    if scope != "all":
-        inputs["scope"] = scope
-    if force:
-        inputs["force"] = True
     body = {"ref": ref, "inputs": inputs} if inputs else {"ref": ref}
     try:
         response = (post or requests.post)(url, headers=headers, json=body, timeout=timeout)

@@ -186,23 +186,113 @@ SELECT id FROM s;
 """
 
 
-def save_search(connect: Connect, result, *, actor_role: Optional[str], actor: str) -> int:
-    """Поиск и решения по подкатегориям — одним запросом (одна транзакция). Возвращает id поиска."""
-    access.require_role(actor_role, access.ROLE_EDITOR)
-    own = [{"node": x.node, "name": x.name, "rank": x.rank} for x in result.own]
+def _result_columns(result) -> tuple:
     cs = result.candidates
-    columns = (
+    return (
         [c.sub.node for c in cs], [c.sub.name[:300] for c in cs], [c.sub.path[:500] for c in cs],
         [c.info.leader_bsr if c.info else None for c in cs],
         [c.verdict.k1 for c in cs], [c.verdict.k2 for c in cs], [c.verdict.k3 for c in cs], [c.verdict.k4 for c in cs],
         [c.relevance for c in cs], [c.verdict.status for c in cs], [c.verdict.priority for c in cs],
         [c.verdict.reason for c in cs],
     )
+
+
+def _own_json(result) -> str:
+    return json.dumps([{"node": x.node, "name": x.name, "rank": x.rank} for x in result.own], ensure_ascii=False)
+
+
+def save_search(connect: Connect, result, *, actor_role: Optional[str], actor: str) -> int:
+    """Поиск и решения по подкатегориям — одним запросом (одна транзакция). Возвращает id поиска."""
+    access.require_role(actor_role, access.ROLE_EDITOR)
     rows = _run(connect, _SAVE_SEARCH_SQL,
                 (result.market, result.asin, actor, result.title[:500], result.our_bsr, result.target_bsr,
-                 result.status, result.error[:500], json.dumps(own, ensure_ascii=False), result.requests, *columns),
+                 result.status, result.error[:500], _own_json(result), result.requests, *_result_columns(result)),
                 fetch=True)
     return rows[0][0]
+
+
+# --- очередь поиска по списку (выполняет best_seller_batch.py в GitHub Actions) ------------------------------------
+
+_ENQUEUE_SQL = """
+INSERT INTO best_seller.searches (marketplace, asin, actor, status)
+SELECT a.marketplace, a.asin, %s, 'queued' FROM best_seller.asins a
+WHERE a.active
+  AND NOT EXISTS (SELECT 1 FROM best_seller.searches s WHERE s.marketplace = a.marketplace AND s.asin = a.asin
+                  AND s.status IN ('queued', 'running'))
+  AND (NOT %s OR NOT EXISTS (SELECT 1 FROM best_seller.searches s WHERE s.marketplace = a.marketplace
+                             AND s.asin = a.asin AND s.status IN ('done', 'not_needed')))
+RETURNING id;
+"""
+
+
+def enqueue_searches(connect: Connect, *, actor_role: Optional[str], actor: str, only_new: bool = True) -> int:
+    """Ставит в очередь поиск по активным ASIN списка. Уже стоящие в очереди или идущие не дублируются;
+    only_new — пропустить те, по которым уже есть готовый результат (не тратить кредиты повторно)."""
+    access.require_role(actor_role, access.ROLE_EDITOR)
+    return len(_run(connect, _ENQUEUE_SQL, (actor, only_new), fetch=True))
+
+
+def claim_next(connect: Connect) -> Optional[dict]:
+    """Берёт следующий поиск из очереди (FOR UPDATE SKIP LOCKED: два воркера не возьмут один и тот же)."""
+    rows = _run(connect, """
+        UPDATE best_seller.searches SET status = 'running', started_at = now()
+        WHERE id = (SELECT id FROM best_seller.searches WHERE status = 'queued' ORDER BY id
+                    FOR UPDATE SKIP LOCKED LIMIT 1)
+        RETURNING id, marketplace, asin, actor;
+        """, fetch=True)
+    if not rows:
+        return None
+    sid, market, asin, actor = rows[0]
+    return {"id": sid, "market": market, "asin": asin, "actor": actor}
+
+
+def recover_stale(connect: Connect, minutes: int = 90) -> int:
+    """Поиски, застрявшие в «идёт» (воркер оборвался), помечаются ошибкой, чтобы их можно было повторить."""
+    return len(_run(connect, """
+        UPDATE best_seller.searches SET status = 'error', error = 'Прервано: поиск не завершился', finished_at = now()
+        WHERE status = 'running' AND started_at < now() - make_interval(mins => %s) RETURNING id;
+        """, (minutes,), fetch=True))
+
+
+def finish_search(connect: Connect, search_id: int, result) -> None:
+    """Записывает итог поиска из очереди: строка searches обновляется, решения по подкатегориям добавляются."""
+    dbutil.run_many(connect, [
+        ("""UPDATE best_seller.searches SET title = %s, our_bsr = %s, target_bsr = %s, status = %s, error = %s,
+                own = %s::jsonb, requests = %s, finished_at = now() WHERE id = %s;""",
+         (result.title[:500], result.our_bsr, result.target_bsr, result.status, result.error[:500],
+          _own_json(result), result.requests, search_id), False),
+        ("""INSERT INTO best_seller.search_results (search_id, node, name, path, leader_bsr, k1, k2, k3, k4,
+                                                   relevance, status, priority, reason)
+            SELECT %s, t.* FROM unnest(%s::text[], %s::text[], %s::text[], %s::int[], %s::bool[], %s::bool[],
+                                       %s::bool[], %s::bool[], %s::text[], %s::text[], %s::text[], %s::text[]) AS t
+            ON CONFLICT (search_id, node) DO NOTHING;""",
+         (search_id, *_result_columns(result)), False),
+    ], error=BestSellerStoreError, what=_WHAT)
+
+
+def fail_search(connect: Connect, search_id: int, message: str) -> None:
+    _run(connect, "UPDATE best_seller.searches SET status = 'error', error = %s, finished_at = now() WHERE id = %s;",
+         (message[:500], search_id))
+
+
+def batch_rows(connect: Connect) -> List[dict]:
+    """Активные ASIN списка с последним поиском по каждому и лучшей подходящей подкатегорией."""
+    rows = _run(connect, """
+        SELECT a.marketplace, a.asin, s.status, s.our_bsr, s.title, s.error, s.own,
+               (SELECT count(*) FROM best_seller.search_results r WHERE r.search_id = s.id AND r.status = 'suitable'),
+               b.name, b.leader_bsr, b.priority
+        FROM best_seller.asins a
+        LEFT JOIN LATERAL (SELECT * FROM best_seller.searches x WHERE x.marketplace = a.marketplace AND x.asin = a.asin
+                           ORDER BY x.started_at DESC, x.id DESC LIMIT 1) s ON TRUE
+        LEFT JOIN LATERAL (SELECT r.name, r.leader_bsr, r.priority FROM best_seller.search_results r
+                           WHERE r.search_id = s.id AND r.status = 'suitable'
+                           ORDER BY CASE r.priority WHEN 'высокий' THEN 0 WHEN 'низкий' THEN 1 ELSE 2 END,
+                                    r.leader_bsr DESC NULLS LAST LIMIT 1) b ON TRUE
+        WHERE a.active ORDER BY a.marketplace, a.asin;
+        """, fetch=True)
+    keys = ("market", "asin", "status", "our_bsr", "title", "error", "own", "suitable", "best", "leader_bsr",
+            "priority")
+    return [dict(zip(keys, row)) for row in rows]
 
 
 def latest_search(connect: Connect, market: str, asin: str) -> Optional[dict]:

@@ -29,7 +29,7 @@ def test_success_sends_exactly_one_authorized_dispatch_without_inputs():
     result = github_dispatch.dispatch_collection(TOKEN, post=post)
     assert result.ok and "отправлен" in result.message
     (url, kwargs), = calls
-    assert url == "https://api.github.com/repos/arseniborulko-bit/parser-not-test/actions/workflows/collect.yml/dispatches"
+    assert url == "https://api.github.com/repos/maximumstoresonline/parser-not-test/actions/workflows/collect.yml/dispatches"
     assert kwargs["json"] == {"ref": "main"}
     assert kwargs["headers"]["Authorization"] == f"Bearer {TOKEN}"
     assert kwargs["headers"]["Accept"] == "application/vnd.github+json"

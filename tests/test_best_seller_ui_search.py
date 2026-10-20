@@ -190,3 +190,10 @@ def test_search_with_a_suitable_row_keeps_the_full_table_and_has_no_hint(monkeyp
     text = page_text(at)
     assert '>Релевантность</div>' in html and '>Приоритет</div>' in html
     assert "Подходящих нет" not in text
+
+
+def test_queued_search_from_the_list_mode_says_so(monkeypatch):
+    for status, word in (("queued", "в очереди"), ("running", "идёт")):
+        at, _ = start(monkeypatch, found={**FOUND, "status": status, "results": []})
+        at.text_input(key="bs_link").set_value("https://www.amazon.com/dp/B0H9LK9T39").run(timeout=30)
+        assert word in page_text(at) and "Подкатегорий для проверки не нашлось" not in page_text(at)
