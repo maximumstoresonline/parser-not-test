@@ -797,7 +797,8 @@ def batch_row_from_db(row: dict) -> BatchRow:
     if row["status"] == "not_needed":
         best = "уже в топ-3 своей подкатегории"
     elif row["status"] == "done":
-        best = row["best"] or "нет подходящих"
+        pending = row.get("pending") or 0
+        best = row["best"] or (f"ждут оценки К3: {pending}" if pending else "нет подходящих")
     elif row["status"] == "error":
         best = row["error"] or None
     return BatchRow(row["asin"], row["market"], "", fmt_int(row["our_bsr"]) if row["our_bsr"] else None, best,

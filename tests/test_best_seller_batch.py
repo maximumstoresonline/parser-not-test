@@ -105,7 +105,7 @@ def test_batch_dispatch_calls_its_own_workflow_without_inputs():
 
 def db_row(asin, status, **extra):
     row = {"market": "US", "asin": asin, "status": status, "our_bsr": 91233, "title": "", "error": "", "own": [],
-           "suitable": 0, "best": None, "leader_bsr": None, "priority": None}
+           "suitable": 0, "pending": 0, "best": None, "leader_bsr": None, "priority": None}
     return {**row, **extra}
 
 
@@ -184,3 +184,9 @@ def test_nothing_to_queue_and_no_rights(monkeypatch):
 def test_without_search_tables_the_mockup_stays(monkeypatch):
     at = start(monkeypatch, ready=False)
     assert any("002_search.sql" in i.value for i in at.info)
+
+
+def test_pending_subcategories_are_not_reported_as_no_match():
+    row = ui.batch_row_from_db(db_row("B0GNBSDL65", "done", pending=3))
+    assert row.best == "ждут оценки К3: 3" and row.suitable == 0
+    assert ui.batch_row_from_db(db_row("B0GNBSDL65", "done")).best == "нет подходящих"
