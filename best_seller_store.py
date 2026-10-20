@@ -280,7 +280,7 @@ def batch_rows(connect: Connect) -> List[dict]:
     rows = _run(connect, """
         SELECT a.marketplace, a.asin, s.status, s.our_bsr, s.title, s.error, s.own,
                (SELECT count(*) FROM best_seller.search_results r WHERE r.search_id = s.id AND r.status = 'suitable'),
-               b.name, b.leader_bsr, b.priority
+               b.name, b.leader_bsr, b.priority, s.started_at, s.finished_at, s.requests, s.actor
         FROM best_seller.asins a
         LEFT JOIN LATERAL (SELECT * FROM best_seller.searches x WHERE x.marketplace = a.marketplace AND x.asin = a.asin
                            ORDER BY x.started_at DESC, x.id DESC LIMIT 1) s ON TRUE
@@ -291,7 +291,7 @@ def batch_rows(connect: Connect) -> List[dict]:
         WHERE a.active ORDER BY a.marketplace, a.asin;
         """, fetch=True)
     keys = ("market", "asin", "status", "our_bsr", "title", "error", "own", "suitable", "best", "leader_bsr",
-            "priority")
+            "priority", "started_at", "finished_at", "requests", "actor")
     return [dict(zip(keys, row)) for row in rows]
 
 

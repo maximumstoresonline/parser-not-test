@@ -70,6 +70,8 @@ class BatchRow:
     suitable: Optional[int]
     priority: Optional[str]
     status: str
+    when: Optional[str] = None  # когда проверен (или поставлен в очередь), по Киеву
+    requests: Optional[int] = None
 
 
 # Пример из макета: листинг B0GNBSDL65 (Scrapingdog), подкатегории и BSR лидеров — из SOP-AMZ-001.
@@ -648,10 +650,10 @@ def _batch_table(rows: Sequence[BatchRow]) -> str:
             f"<tr><td>{asin}</td><td>{escape(row.market)}</td><td>{escape(row.group)}</td><td class='bs-num'>{escape(row.our_bsr or '–')}</td>"
             f"<td>{best}</td><td class='bs-num'>{fmt_int(row.leader_bsr)}</td>"
             f"<td class='bs-num'><b>{'–' if row.suitable is None else row.suitable}</b></td>"
-            f"<td>{priority}</td><td>{status}</td></tr>"
+            f"<td>{priority}</td><td>{status}</td><td class='bs-sub'>{escape(row.when or '–')}</td></tr>"
         )
     head = ("<tr><th>ASIN</th><th>Страна</th><th>Группа</th><th class='bs-num'>Наш BSR</th><th>Лучшая подкатегория</th>"
-            "<th class='bs-num'>BSR лидера</th><th class='bs-num'>Подходят</th><th>Приоритет</th><th>Статус</th></tr>")
+            "<th class='bs-num'>BSR лидера</th><th class='bs-num'>Подходят</th><th>Приоритет</th><th>Статус</th><th>Проверен</th></tr>")
     return f'<table class="bs-table"><thead>{head}</thead><tbody>{"".join(body)}</tbody></table>'
 
 
@@ -776,6 +778,18 @@ _STATUS_LABELS = {"queued": "в очереди", "running": "идёт поиск
                   "error": "ошибка запроса"}
 
 
+def fmt_when(moment) -> Optional[str]:
+    """Время по Киеву: «20.10 19:51». Без часового пояса в базе — считаем UTC."""
+    if moment is None:
+        return None
+    from datetime import timezone
+    from zoneinfo import ZoneInfo
+
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(ZoneInfo("Europe/Kyiv")).strftime("%d.%m %H:%M")
+
+
 def batch_row_from_db(row: dict) -> BatchRow:
     """Строка таблицы списка из последнего поиска по ASIN (best_seller_store.batch_rows)."""
     status = _STATUS_LABELS.get(row["status"], "ещё не искали")
@@ -787,7 +801,8 @@ def batch_row_from_db(row: dict) -> BatchRow:
     elif row["status"] == "error":
         best = row["error"] or None
     return BatchRow(row["asin"], row["market"], "", fmt_int(row["our_bsr"]) if row["our_bsr"] else None, best,
-                    row["leader_bsr"], row["suitable"] if row["status"] == "done" else None, row["priority"], status)
+                    row["leader_bsr"], row["suitable"] if row["status"] == "done" else None, row["priority"], status,
+                    fmt_when(row.get("finished_at") or row.get("started_at")), row.get("requests"))
 
 
 def batch_counts(rows: Sequence[BatchRow]) -> Tuple[int, int, int, int, int]:
@@ -807,10 +822,11 @@ def batch_csv(rows: Sequence[BatchRow]) -> str:
     out = io.StringIO()
     writer = csv.writer(out)
     writer.writerow(["ASIN", "Страна", "Наш BSR", "Лучшая подкатегория", "BSR лидера", "Подходят", "Приоритет",
-                     "Статус"])
+                     "Статус", "Проверен (Киев)", "Запросов ScrapingDog"])
     for r in rows:
         writer.writerow([r.asin, r.market, r.our_bsr or "", r.best or "", r.leader_bsr or "",
-                         "" if r.suitable is None else r.suitable, r.priority or "", r.status])
+                         "" if r.suitable is None else r.suitable, r.priority or "", r.status, r.when or "",
+                         "" if r.requests is None else r.requests])
     return out.getvalue()
 
 
@@ -860,7 +876,8 @@ def _render_batch_live(connect, actor: str, can_edit: bool, dispatch_token: str,
     if not can_edit:
         st.caption("Запускать поиск может сотрудник с правом редактирования.")
     try:
-        rows = [batch_row_from_db(r) for r in best_seller_store.batch_rows(connect)]
+        raw = best_seller_store.batch_rows(connect)
+        rows = [batch_row_from_db(r) for r in raw]
     except best_seller_store.BestSellerStoreError as exc:
         st.error(str(exc))
         return
@@ -869,10 +886,14 @@ def _render_batch_live(connect, actor: str, can_edit: bool, dispatch_token: str,
         return
     done, with_, without, errors, active = batch_counts(rows)
     total = len(rows)
+    finished = [r["finished_at"] for r in raw if r.get("finished_at")]
+    last = fmt_when(max(finished)) if finished else None
+    spent = sum(r.get("requests") or 0 for r in raw)
     with st.container(border=True):
         st.markdown(
             f'<div class="bs-progress-head"><span class="bs-progress-title">Обработано {done} из {total}</span>'
-            f'<span class="bs-meta">в очереди или идёт поиск: {active}</span></div>', unsafe_allow_html=True)
+            f'<span class="bs-meta">в очереди или идёт поиск: {active} · последняя проверка: {last or "–"} · '
+            f'запросов ScrapingDog: {spent}</span></div>', unsafe_allow_html=True)
         st.markdown(f'<div class="bs-bar"><div style="width:{done / total:.1%}"></div></div>', unsafe_allow_html=True)
         tiles = "".join(
             f'<div class="bs-tile"><div class="bs-tile-label">{escape(label)}</div>'
