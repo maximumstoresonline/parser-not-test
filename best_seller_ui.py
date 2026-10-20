@@ -11,13 +11,14 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from html import escape
-from typing import List, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import streamlit as st
 
 import access
 
 import best_seller
+import best_seller_sheet
 import best_seller_store
 import pairs_store
 
@@ -57,6 +58,7 @@ class Subcategory:
     leader_badge: Optional[bool] = None
     dept: Optional[str] = None  # раздел Best Sellers в ссылке (/gp/bestsellers/<dept>/<node>)
     leader_asin: Optional[str] = None
+    written: bool = False  # уже записана в таблицу гипотез
 
 
 @dataclass(frozen=True)
@@ -347,7 +349,7 @@ _COLS_SHORT = [0.45, 3.4, 1.1, 1.2, 0.4, 3.6]
 
 
 def _results(key: str, evaluated: List[Tuple[Subcategory, best_seller.Verdict]], domain: Optional[str] = None,
-             target: Optional[int] = None) -> None:
+             target: Optional[int] = None, on_write: Optional[Callable[[List[str]], None]] = None) -> None:
     """domain — домен Amazon страны поиска (ca, com, de…): по нему названия подкатегорий и ASIN лидеров становятся
     ссылками. target — целевой BSR: нужен, чтобы объяснить отказ по К1 числами."""
     deep = any(v.k2 is not None or v.k3 is not None or v.k4 is not None or v.status == best_seller.SUITABLE
@@ -374,16 +376,19 @@ def _results(key: str, evaluated: List[Tuple[Subcategory, best_seller.Verdict]],
         for col, title in zip(st.columns(layout), header):
             css = "bs-th bs-num" if title in ("BSR лидера", "Лидер / наша цель") else "bs-th"
             col.markdown(f'<div class="{css}">{escape(title)}</div>', unsafe_allow_html=True)
-        selected = 0
+        selected, chosen = 0, []
         for index, (sub, verdict) in enumerate(evaluated):
             cols = st.columns(layout, vertical_alignment="center")
             ok = verdict.status == best_seller.SUITABLE
-            if cols[0].checkbox(sub.name, value=ok and verdict.priority == best_seller.HIGH, disabled=not ok,
-                                key=f"bs_pick_{key}_{sub.node}", label_visibility="collapsed"):
+            if cols[0].checkbox(sub.name, value=ok and not sub.written and verdict.priority == best_seller.HIGH,
+                                disabled=not ok or sub.written, key=f"bs_pick_{key}_{sub.node}",
+                                label_visibility="collapsed"):
                 selected += ok
+                chosen.append(sub.node)
             cols[1].markdown(
                 f'<div class="bs-name">{_link(sub.name, node_url(domain, sub.dept, sub.node))}</div>'
-                f'<div class="bs-sub">{escape(" · ".join(x for x in (sub.path, sub.node) if x))}</div>',
+                f'<div class="bs-sub">{escape(" · ".join(x for x in (sub.path, sub.node) if x))}</div>'
+                + (f'<div>{_pill("записана в таблицу", "bs-muted")}</div>' if sub.written else ""),
                 unsafe_allow_html=True,
             )
             leader = f'<div class="bs-num"><b>{fmt_int(sub.leader_bsr)}</b></div>'
@@ -415,9 +420,13 @@ def _results(key: str, evaluated: List[Tuple[Subcategory, best_seller.Verdict]],
         if hint:
             st.markdown(f'<div class="bs-hint">{escape(hint)}</div>', unsafe_allow_html=True)
         button, note = st.columns([1.3, 3], vertical_alignment="center")
-        _soon(button, "Записать выбранные в таблицу гипотез", "bs_write_one", WRITE_LATER, disabled=not selected)
-        note.markdown(f'<span class="bs-meta">Выбрано: {selected} → Google-таблица «{escape(SHEET_NAME)}»</span>',
-                      unsafe_allow_html=True)
+        if on_write is None:
+            _soon(button, "Записать выбранные в таблицу гипотез", "bs_write_one", WRITE_LATER, disabled=not selected)
+        elif button.button("Записать выбранные в таблицу гипотез", key="bs_write_one", width="stretch",
+                           disabled=not selected):
+            on_write(chosen)
+        note.markdown(f'<span class="bs-meta">Выбрано: {selected} → Google-таблица «{escape(SHEET_NAME)}», '
+                      f'лист «{escape(best_seller_sheet.TAB)}»</span>', unsafe_allow_html=True)
 
 
 def _legend() -> None:
@@ -517,13 +526,46 @@ def _found_pairs(found: dict) -> List[Tuple[Subcategory, best_seller.Verdict]]:
     for row in found["results"]:
         ratio = row["leader_bsr"] / target if row["leader_bsr"] and target else None
         sub = Subcategory(row["name"] or row["node"], row.get("path") or "", row["node"], row["leader_bsr"],
-                          relevance=row["relevance"], dept=row.get("dept"), leader_asin=row.get("leader_asin"))
+                          relevance=row["relevance"], dept=row.get("dept"), leader_asin=row.get("leader_asin"),
+                          written=bool(row.get("written")))
         pairs.append((sub, best_seller.Verdict(row["k1"], row["k2"], row["k3"], row["k4"], row["status"],
                                                row["priority"], ratio, row["reason"])))
     return pairs
 
 
-def _render_single(connect=None, actor: str = "", can_edit: bool = False, token: str = "") -> None:
+NO_SHEET_KEY = ("Нет ключа Google в секретах (GOOGLE_SERVICE_ACCOUNT_JSON или раздел [gcp_service_account]): "
+                "запись в таблицу гипотез недоступна.")
+
+
+def write_to_sheet(connect, writer, items: Sequence[dict]) -> Optional[str]:
+    """Пишет подкатегории в таблицу гипотез и отмечает их в базе. Возвращает сообщение об успехе или None (ошибка
+    уже показана). items — словари с search_id, market, asin, title, target_bsr, node, name, path, dept, …"""
+    if not items:
+        return None
+    if writer is None:
+        st.warning(NO_SHEET_KEY)
+        return None
+    try:
+        result = writer(items)
+        by_search = {}
+        for item in items:
+            if best_seller_sheet.subcategory_url(item["market"], item.get("dept"), item["node"]):
+                by_search.setdefault(item["search_id"], []).append(item["node"])
+        for search_id, nodes in by_search.items():
+            best_seller_store.mark_written(connect, search_id, nodes)
+    except (best_seller_sheet.SheetError, best_seller_store.BestSellerStoreError) as exc:
+        st.error(str(exc))
+        return None
+    text = f"Записано в таблицу: {result.written}"
+    if result.duplicates:
+        text += f" · уже были на листе: {result.duplicates}"
+    if result.no_link:
+        text += f" · без ссылки пропущено: {result.no_link}"
+    return text
+
+
+def _render_single(connect=None, actor: str = "", can_edit: bool = False, token: str = "",
+                   sheet_writer=None) -> None:
     problem = _search_problem(connect)
     if problem:
         st.info(problem)
@@ -580,8 +622,21 @@ def _render_single(connect=None, actor: str = "", can_edit: bool = False, token:
     if not found["results"]:
         st.info("Подкатегорий для проверки не нашлось.")
         return
+    def on_write(nodes: List[str]) -> None:
+        items = [{**row, "search_id": found["id"], "market": found["market"], "asin": found["asin"],
+                  "title": found["title"], "target_bsr": found.get("target_bsr")}
+                 for row in found["results"] if row["node"] in nodes]
+        message = write_to_sheet(connect, sheet_writer, items)
+        if message:
+            st.session_state["bs_sheet_flash"] = message
+            st.rerun()
+
+    flash = st.session_state.pop("bs_sheet_flash", None)
+    if flash:
+        st.success(flash)
     _results(f"{found['market']}_{found['asin']}", _found_pairs(found),
-             domain=pairs_store.DOMAIN_BY_MARKET.get(found["market"]), target=found.get("target_bsr"))
+             domain=pairs_store.DOMAIN_BY_MARKET.get(found["market"]), target=found.get("target_bsr"),
+             on_write=on_write)
     _legend()
     _relevance_review(connect, found, can_edit)
 
@@ -893,7 +948,8 @@ def _start_batch(connect, actor: str, can_edit: bool, dispatch_token: str, repo:
                    "Его можно запустить вручную: GitHub → Actions → «Best Seller — поиск по списку».")
 
 
-def _render_batch_live(connect, actor: str, can_edit: bool, dispatch_token: str, repo: str) -> None:
+def _render_batch_live(connect, actor: str, can_edit: bool, dispatch_token: str, repo: str,
+                       sheet_writer=None) -> None:
     flash = st.session_state.pop("bs_batch_flash", None)
     if flash:
         st.success(flash)
@@ -942,8 +998,24 @@ def _render_batch_live(connect, actor: str, can_edit: bool, dispatch_token: str,
             st.markdown(_batch_table(shown), unsafe_allow_html=True)
         else:
             st.info("Под фильтр ничего не подходит.")
-        st.download_button("Выгрузить в CSV", batch_csv(shown), file_name="best_seller_search.csv",
-                           mime="text/csv", key="bs_batch_csv_out", disabled=not shown)
+        csv_col, write_col = st.columns([1, 3], vertical_alignment="center")
+        csv_col.download_button("Выгрузить в CSV", batch_csv(shown), file_name="best_seller_search.csv",
+                                mime="text/csv", key="bs_batch_csv_out", disabled=not shown)
+        if write_col.button("Записать все с высоким приоритетом в таблицу гипотез", key="bs_batch_write",
+                            disabled=not can_edit):
+            try:
+                items = best_seller_store.unwritten_high(connect)
+            except best_seller_store.BestSellerStoreError as exc:
+                st.error(str(exc))
+                items = None
+            if items is not None:
+                message = write_to_sheet(connect, sheet_writer, items) if items else None
+                if message:
+                    st.session_state["bs_batch_flash"] = message
+                    st.rerun()
+                elif not items:
+                    st.info("Нечего записывать: подходящих подкатегорий с высоким приоритетом, ещё не записанных "
+                            "в таблицу, нет.")
     st.markdown(
         '<p class="bs-legend">Подробный результат по ASIN (подкатегории и критерии К1–К4) — в режиме «Один ASIN»: '
         'введите тот же ASIN, там покажется последний поиск. Если ASIN уже в топ-3 своей подкатегории, поиск не '
@@ -952,7 +1024,7 @@ def _render_batch_live(connect, actor: str, can_edit: bool, dispatch_token: str,
 
 
 def _render_batch(connect=None, actor: str = "", can_edit: bool = False, dispatch_token: str = "",
-                  repo: str = "") -> None:
+                  repo: str = "", sheet_writer=None) -> None:
     st.markdown('<p class="section-title">Поиск подкатегорий: список ASIN</p>', unsafe_allow_html=True)
     st.markdown(
         '<p class="section-note">Один поиск на много ASIN. Топ-100 каждой подкатегории берётся один раз и хранится '
@@ -961,7 +1033,7 @@ def _render_batch(connect=None, actor: str = "", can_edit: bool = False, dispatc
     )
     _render_watchlist(connect, actor, can_edit)
     if _batch_ready(connect):
-        _render_batch_live(connect, actor, can_edit, dispatch_token, repo)
+        _render_batch_live(connect, actor, can_edit, dispatch_token, repo, sheet_writer)
         return
     st.info("Таблиц поиска в базе ещё нет (best_seller_db/002_search.sql) или база не подключена: ниже пример из "
             "макета.")
@@ -1016,7 +1088,7 @@ def _render_batch(connect=None, actor: str = "", can_edit: bool = False, dispatc
 
 
 def render(connect=None, actor: str = "", can_edit: bool = False, token: str = "", dispatch_token: str = "",
-           repo: str = "") -> None:
+           repo: str = "", sheet_writer=None) -> None:
     """connect — подключение к базе дашборда (таблицы раздела — в схеме best_seller; None — нет базы);
     can_edit — может ли менять список."""
     st.markdown(_CSS, unsafe_allow_html=True)
@@ -1024,6 +1096,6 @@ def render(connect=None, actor: str = "", can_edit: bool = False, token: str = "
             "следующим шагом.")
     mode = st.radio("Режим", MODES, horizontal=True, key="bs_mode", label_visibility="collapsed")
     if mode == MODES[0]:
-        _render_single(connect, actor, can_edit, token)
+        _render_single(connect, actor, can_edit, token, sheet_writer)
     else:
-        _render_batch(connect, actor, can_edit, dispatch_token, repo)
+        _render_batch(connect, actor, can_edit, dispatch_token, repo, sheet_writer)

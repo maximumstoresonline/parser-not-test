@@ -326,17 +326,46 @@ def latest_search(connect: Connect, market: str, asin: str) -> Optional[dict]:
     # стоит в топе»). Берутся только там, где К3 вообще оценивается (К1 и К2 пройдены).
     results = _run(connect, """
         SELECT r.node, r.name, r.path, r.leader_bsr, r.k1, r.k2, r.k3, r.k4, r.relevance, r.status, r.priority,
-               r.reason, CASE WHEN r.k1 AND r.k2 THEN c.top END, c.dept, c.leader_asin
+               r.reason, CASE WHEN r.k1 AND r.k2 THEN c.top END, c.dept, c.leader_asin, r.written_to_sheet
         FROM best_seller.search_results r
         LEFT JOIN best_seller.node_cache c ON c.marketplace = %s AND c.node = r.node
         WHERE r.search_id = %s
         ORDER BY CASE r.status WHEN 'suitable' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END, r.leader_bsr DESC NULLS LAST;
         """, (market, sid), fetch=True)
     keys = ("node", "name", "path", "leader_bsr", "k1", "k2", "k3", "k4", "relevance", "status", "priority", "reason",
-            "top", "dept", "leader_asin")
+            "top", "dept", "leader_asin", "written")
     return {"id": sid, "market": market, "asin": asin, "title": title, "our_bsr": our, "target_bsr": target,
             "status": status, "error": error, "own": list(own or []), "requests": requests, "actor": actor,
             "finished_at": finished, "results": [dict(zip(keys, row)) for row in results]}
+
+
+def mark_written(connect: Connect, search_id: int, nodes: Sequence[str]) -> int:
+    """Отметка «записано в таблицу гипотез» — чтобы не писать одно и то же второй раз."""
+    return len(_run(connect, """
+        UPDATE best_seller.search_results SET written_to_sheet = TRUE
+        WHERE search_id = %s AND node = ANY(%s::text[]) RETURNING node;
+        """, (search_id, list(nodes)), fetch=True))
+
+
+def unwritten_high(connect: Connect) -> List[dict]:
+    """Подходящие подкатегории с высоким приоритетом из последнего готового поиска по каждому активному ASIN,
+    ещё не записанные в таблицу гипотез."""
+    rows = _run(connect, """
+        WITH latest AS (
+            SELECT DISTINCT ON (marketplace, asin) * FROM best_seller.searches WHERE status = 'done'
+            ORDER BY marketplace, asin, started_at DESC, id DESC)
+        SELECT s.id, s.marketplace, s.asin, s.title, s.target_bsr, r.node, r.name, r.path, c.dept, r.leader_bsr,
+               r.relevance, r.priority
+        FROM latest s
+        JOIN best_seller.asins a ON a.marketplace = s.marketplace AND a.asin = s.asin AND a.active
+        JOIN best_seller.search_results r ON r.search_id = s.id AND r.status = 'suitable'
+             AND r.priority = 'высокий' AND NOT r.written_to_sheet
+        LEFT JOIN best_seller.node_cache c ON c.marketplace = s.marketplace AND c.node = r.node
+        ORDER BY s.marketplace, s.asin, r.leader_bsr DESC NULLS LAST;
+        """, fetch=True)
+    keys = ("search_id", "market", "asin", "title", "target_bsr", "node", "name", "path", "dept", "leader_bsr",
+            "relevance", "priority")
+    return [dict(zip(keys, row)) for row in rows]
 
 
 def set_relevance(connect: Connect, search_id: int, node: str, relevance: str, *,
