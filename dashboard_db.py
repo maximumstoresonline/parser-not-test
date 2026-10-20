@@ -100,6 +100,13 @@ def _sheet_writer():
     return best_seller_sheet.make_writer(info, _secret("BEST_SELLER_SHEET_ID") or best_seller_sheet.SPREADSHEET_ID)
 
 
+def _sheet_reader():
+    info = _google_key_info()
+    if not info:
+        return None
+    return best_seller_sheet.SheetReader(info, _secret("BEST_SELLER_SHEET_ID") or best_seller_sheet.SPREADSHEET_ID)
+
+
 def _max_active() -> int:
     raw = _secret("MAX_ACTIVE_PAIRS").strip()
     return int(raw) if raw.isdigit() and int(raw) > 0 else pairs_store.DEFAULT_MAX_ACTIVE
@@ -2170,7 +2177,8 @@ def main() -> None:
         # Та же база, своя схема best_seller (таблицы мониторинга не трогаются).
         best_seller_ui.render(_connect, actor, access.has_role(manage_role, access.ROLE_EDITOR),
                               _secret("SCRAPINGDOG_TOKEN"), _secret("GITHUB_DISPATCH_TOKEN"),
-                              _secret("GITHUB_REPO") or github_dispatch.DEFAULT_REPO, _sheet_writer())
+                              _secret("GITHUB_REPO") or github_dispatch.DEFAULT_REPO, _sheet_writer(),
+                              _sheet_reader())
         return
 
     if not _management_open() and manage_role is None:

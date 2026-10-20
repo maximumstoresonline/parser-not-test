@@ -23,7 +23,7 @@ import best_seller_store
 import pairs_store
 
 SHEET_NAME = "Получение bs за счет смены под категории"
-MODES = ("Один ASIN", "Список ASIN")
+MODES = ("Один ASIN", "Список ASIN", "Таблица гипотез")
 STATUS_FILTERS = ("Все", "С подходящими", "Без подходящих", "Ошибки")
 NOT_CONNECTED = "Поиск ещё не подключён: сначала разведка ScrapingDog (этап 0)."
 WRITE_LATER = "Запись в Google-таблицу гипотез подключим после поиска (этап 3)."
@@ -1087,15 +1087,56 @@ def _render_batch(connect=None, actor: str = "", can_edit: bool = False, dispatc
     )
 
 
+SHEET_VIEWS = ("Best Seller (авто)", "Основной лист (Артур)")
+
+
+def _render_hypotheses(sheet_reader) -> None:
+    """Таблица гипотез из Google внутри дашборда (только чтение): лист, куда пишет дашборд, и основной лист."""
+    st.markdown('<p class="section-title">Таблица гипотез</p>', unsafe_allow_html=True)
+    st.markdown('<p class="section-note">То, что записано в Google-таблицу «' + escape(SHEET_NAME) + '». Здесь только '
+                'просмотр: записывать подкатегории — кнопками в режимах «Один ASIN» и «Список ASIN».</p>',
+                unsafe_allow_html=True)
+    if sheet_reader is None:
+        st.info(NO_SHEET_KEY)
+        return
+    left, mid, right = st.columns([2, 2, 1], vertical_alignment="bottom")
+    view = left.radio("Лист", SHEET_VIEWS, horizontal=True, key="bs_sheet_view", label_visibility="collapsed")
+    query = mid.text_input("Поиск по таблице", placeholder="ASIN или часть названия…", key="bs_sheet_query")
+    refresh = right.button("Обновить", key="bs_sheet_refresh")
+    tab = best_seller_sheet.TAB if view == SHEET_VIEWS[0] else best_seller_sheet.MAIN
+    cache = st.session_state.setdefault("bs_sheet_cache", {})
+    if refresh or tab not in cache:
+        try:
+            cache[tab] = sheet_reader.read(tab)
+        except best_seller_sheet.SheetError as exc:
+            st.error(str(exc))
+            return
+    header, rows = cache[tab]
+    st.markdown(f'<a href="{escape(sheet_reader.url)}" target="_blank" rel="noopener noreferrer">Открыть таблицу в '
+                'Google</a>', unsafe_allow_html=True)
+    if not header or not rows:
+        st.info("На этом листе пока нет строк." if tab == best_seller_sheet.MAIN else
+                "Лист «" + best_seller_sheet.TAB + "» пока пуст: записей из дашборда ещё не было.")
+        return
+    needle = query.strip().lower()
+    shown = [r for r in rows if not needle or needle in " ".join(r).lower()]
+    import pandas as pd
+
+    frame = pd.DataFrame(shown, columns=header)
+    st.caption(f"Строк: {len(shown)} из {len(rows)}")
+    st.dataframe(frame, hide_index=True, width="stretch",
+                 column_config={header[0]: st.column_config.LinkColumn(header[0], display_text=r".*/(\d+)/?$")})
+
+
 def render(connect=None, actor: str = "", can_edit: bool = False, token: str = "", dispatch_token: str = "",
-           repo: str = "", sheet_writer=None) -> None:
+           repo: str = "", sheet_writer=None, sheet_reader=None) -> None:
     """connect — подключение к базе дашборда (таблицы раздела — в схеме best_seller; None — нет базы);
     can_edit — может ли менять список."""
     st.markdown(_CSS, unsafe_allow_html=True)
-    st.info("Раздел в разработке: поиск по одному ASIN и по списку работают, запись в таблицу гипотез — "
-            "следующим шагом.")
     mode = st.radio("Режим", MODES, horizontal=True, key="bs_mode", label_visibility="collapsed")
     if mode == MODES[0]:
         _render_single(connect, actor, can_edit, token, sheet_writer)
+    elif mode == MODES[2]:
+        _render_hypotheses(sheet_reader)
     else:
         _render_batch(connect, actor, can_edit, dispatch_token, repo, sheet_writer)

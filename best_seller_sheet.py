@@ -108,3 +108,40 @@ def make_writer(info: Mapping, sheet_id: str = SPREADSHEET_ID,
         return WriteResult(written, duplicates, no_link)
 
     return write
+
+
+MAIN = "main"  # первый (основной) лист таблицы — его ведёт Артур, два столбца без шапки
+MAIN_HEADERS = ["Ссылка на подкатегорию", "Товар-кандидат", "Заметки"]
+
+
+class SheetReader:
+    """Чтение таблицы гипотез для показа в дашборде (только чтение). Ключ сервисного аккаунта — из секретов."""
+
+    def __init__(self, info: Mapping, sheet_id: str = SPREADSHEET_ID, client_factory: Optional[Callable] = None):
+        self._info, self.sheet_id, self._factory = info, sheet_id, client_factory
+
+    @property
+    def url(self) -> str:
+        return f"https://docs.google.com/spreadsheets/d/{self.sheet_id}/edit"
+
+    def read(self, tab: str) -> Tuple[List[str], List[List[str]]]:
+        """(шапка, строки) листа TAB или основного листа (tab == MAIN). Пустые строки отбрасываются."""
+        try:
+            import gspread
+
+            client = (self._factory or gspread.service_account_from_dict)(dict(self._info))
+            spreadsheet = client.open_by_key(self.sheet_id)
+            try:
+                values = (spreadsheet.get_worksheet(0) if tab == MAIN else spreadsheet.worksheet(tab)).get_all_values()
+            except gspread.WorksheetNotFound:
+                return [], []
+        except Exception as exc:  # noqa: BLE001 — текст ошибки драйвера не показываем
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status in (403, 404):
+                raise SheetError("Нет доступа к таблице: добавьте сервисный аккаунт Google в таблицу (хотя бы как "
+                                 "читателя).") from None
+            raise SheetError(f"Не удалось прочитать Google-таблицу ({type(exc).__name__}).") from None
+        values = [row for row in values if any(cell.strip() for cell in row)]
+        if tab == MAIN:
+            return MAIN_HEADERS, [(row + [""] * 3)[:3] for row in values]
+        return (values[0], [(row + [""] * len(values[0]))[:len(values[0])] for row in values[1:]]) if values else ([], [])
