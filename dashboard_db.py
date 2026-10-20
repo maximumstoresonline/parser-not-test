@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from html import escape
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable
 
 import altair as alt
 import numpy as np
@@ -30,7 +30,6 @@ from dotenv import load_dotenv
 
 import access
 import activity
-import best_seller_sheet
 import best_seller_ui
 import collect_ui
 import forecast_ui
@@ -72,39 +71,6 @@ def _secret(name: str) -> str:
         return str(st.secrets.get(name) or "")
     except Exception:
         return ""
-
-
-def _google_key_info() -> Optional[dict]:
-    """Ключ сервисного аккаунта Google из секретов: JSON-строка GOOGLE_SERVICE_ACCOUNT_JSON или раздел
-    [gcp_service_account]. Значения никуда не выводятся."""
-    import json
-
-    raw = _secret("GOOGLE_SERVICE_ACCOUNT_JSON").strip()
-    if raw:
-        try:
-            info = json.loads(raw)
-            return info if isinstance(info, dict) else None
-        except ValueError:
-            return None
-    try:
-        section = st.secrets.get("gcp_service_account")
-        return dict(section) if section else None
-    except Exception:
-        return None
-
-
-def _sheet_writer():
-    info = _google_key_info()
-    if not info:
-        return None
-    return best_seller_sheet.make_writer(info, _secret("BEST_SELLER_SHEET_ID") or best_seller_sheet.SPREADSHEET_ID)
-
-
-def _sheet_reader():
-    info = _google_key_info()
-    if not info:
-        return None
-    return best_seller_sheet.SheetReader(info, _secret("BEST_SELLER_SHEET_ID") or best_seller_sheet.SPREADSHEET_ID)
 
 
 def _max_active() -> int:
@@ -2177,8 +2143,7 @@ def main() -> None:
         # Та же база, своя схема best_seller (таблицы мониторинга не трогаются).
         best_seller_ui.render(_connect, actor, access.has_role(manage_role, access.ROLE_EDITOR),
                               _secret("SCRAPINGDOG_TOKEN"), _secret("GITHUB_DISPATCH_TOKEN"),
-                              _secret("GITHUB_REPO") or github_dispatch.DEFAULT_REPO, _sheet_writer(),
-                              _sheet_reader())
+                              _secret("GITHUB_REPO") or github_dispatch.DEFAULT_REPO)
         return
 
     if not _management_open() and manage_role is None:

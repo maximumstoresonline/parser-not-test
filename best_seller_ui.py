@@ -18,15 +18,13 @@ import streamlit as st
 import access
 
 import best_seller
-import best_seller_sheet
 import best_seller_store
 import pairs_store
 
-SHEET_NAME = "Получение bs за счет смены под категории"
 MODES = ("Один ASIN", "Список ASIN", "Таблица гипотез")
 STATUS_FILTERS = ("Все", "С подходящими", "Без подходящих", "Ошибки")
 NOT_CONNECTED = "Поиск ещё не подключён: сначала разведка ScrapingDog (этап 0)."
-WRITE_LATER = "Запись в Google-таблицу гипотез подключим после поиска (этап 3)."
+WRITE_LATER = "В демо-примере запись в таблицу гипотез не работает: она включается для реальных результатов поиска."
 # Как в форме «Добавить пару»: только полная ссылка Amazon, чтобы страна была видна из самой ссылки
 # (владелец, 15.10.2026). Голый ASIN не принимается.
 LINK_HINT = "Нужна полная ссылка на товар Amazon, например https://www.amazon.de/dp/B07WVYMY7Y — по ней видна страна."
@@ -58,7 +56,7 @@ class Subcategory:
     leader_badge: Optional[bool] = None
     dept: Optional[str] = None  # раздел Best Sellers в ссылке (/gp/bestsellers/<dept>/<node>)
     leader_asin: Optional[str] = None
-    written: bool = False  # уже записана в таблицу гипотез
+    written: bool = False  # уже в таблице гипотез гипотез
 
 
 @dataclass(frozen=True)
@@ -388,7 +386,7 @@ def _results(key: str, evaluated: List[Tuple[Subcategory, best_seller.Verdict]],
             cols[1].markdown(
                 f'<div class="bs-name">{_link(sub.name, node_url(domain, sub.dept, sub.node))}</div>'
                 f'<div class="bs-sub">{escape(" · ".join(x for x in (sub.path, sub.node) if x))}</div>'
-                + (f'<div>{_pill("записана в таблицу", "bs-muted")}</div>' if sub.written else ""),
+                + (f'<div>{_pill("в таблице гипотез", "bs-muted")}</div>' if sub.written else ""),
                 unsafe_allow_html=True,
             )
             leader = f'<div class="bs-num"><b>{fmt_int(sub.leader_bsr)}</b></div>'
@@ -421,12 +419,12 @@ def _results(key: str, evaluated: List[Tuple[Subcategory, best_seller.Verdict]],
             st.markdown(f'<div class="bs-hint">{escape(hint)}</div>', unsafe_allow_html=True)
         button, note = st.columns([1.3, 3], vertical_alignment="center")
         if on_write is None:
-            _soon(button, "Записать выбранные в таблицу гипотез", "bs_write_one", WRITE_LATER, disabled=not selected)
-        elif button.button("Записать выбранные в таблицу гипотез", key="bs_write_one", width="stretch",
+            _soon(button, "Добавить выбранные в таблицу гипотез", "bs_write_one", WRITE_LATER, disabled=not selected)
+        elif button.button("Добавить выбранные в таблицу гипотез", key="bs_write_one", width="stretch",
                            disabled=not selected):
             on_write(chosen)
-        note.markdown(f'<span class="bs-meta">Выбрано: {selected} → Google-таблица «{escape(SHEET_NAME)}», '
-                      f'лист «{escape(best_seller_sheet.TAB)}»</span>', unsafe_allow_html=True)
+        note.markdown(f'<span class="bs-meta">Выбрано: {selected} → вкладка «Таблица гипотез»</span>',
+                      unsafe_allow_html=True)
 
 
 def _legend() -> None:
@@ -533,39 +531,24 @@ def _found_pairs(found: dict) -> List[Tuple[Subcategory, best_seller.Verdict]]:
     return pairs
 
 
-NO_SHEET_KEY = ("Нет ключа Google в секретах (GOOGLE_SERVICE_ACCOUNT_JSON или раздел [gcp_service_account]): "
-                "запись в таблицу гипотез недоступна.")
-
-
-def write_to_sheet(connect, writer, items: Sequence[dict]) -> Optional[str]:
-    """Пишет подкатегории в таблицу гипотез и отмечает их в базе. Возвращает сообщение об успехе или None (ошибка
-    уже показана). items — словари с search_id, market, asin, title, target_bsr, node, name, path, dept, …"""
+def add_to_hypotheses(connect, can_edit: bool, items: Sequence[dict]) -> Optional[str]:
+    """Добавляет подкатегории в таблицу гипотез (в базе дашборда). items — словари с search_id и node.
+    Возвращает сообщение об успехе или None (ошибка уже показана)."""
     if not items:
         return None
-    if writer is None:
-        st.warning(NO_SHEET_KEY)
-        return None
+    by_search: dict = {}
+    for item in items:
+        by_search.setdefault(item["search_id"], []).append(item["node"])
     try:
-        result = writer(items)
-        by_search = {}
-        for item in items:
-            if best_seller_sheet.subcategory_url(item["market"], item.get("dept"), item["node"]):
-                by_search.setdefault(item["search_id"], []).append(item["node"])
-        for search_id, nodes in by_search.items():
-            best_seller_store.mark_written(connect, search_id, nodes)
-    except (best_seller_sheet.SheetError, best_seller_store.BestSellerStoreError) as exc:
+        added = sum(best_seller_store.mark_written(connect, sid, nodes, actor_role=best_seller_role(can_edit))
+                    for sid, nodes in by_search.items())
+    except (best_seller_store.BestSellerStoreError, access.AccessDenied) as exc:
         st.error(str(exc))
         return None
-    text = f"Записано в таблицу: {result.written}"
-    if result.duplicates:
-        text += f" · уже были на листе: {result.duplicates}"
-    if result.no_link:
-        text += f" · без ссылки пропущено: {result.no_link}"
-    return text
+    return f"Добавлено в таблицу гипотез: {added}. Смотрите во вкладке «Таблица гипотез»."
 
 
-def _render_single(connect=None, actor: str = "", can_edit: bool = False, token: str = "",
-                   sheet_writer=None) -> None:
+def _render_single(connect=None, actor: str = "", can_edit: bool = False, token: str = "") -> None:
     problem = _search_problem(connect)
     if problem:
         st.info(problem)
@@ -626,7 +609,7 @@ def _render_single(connect=None, actor: str = "", can_edit: bool = False, token:
         items = [{**row, "search_id": found["id"], "market": found["market"], "asin": found["asin"],
                   "title": found["title"], "target_bsr": found.get("target_bsr")}
                  for row in found["results"] if row["node"] in nodes]
-        message = write_to_sheet(connect, sheet_writer, items)
+        message = add_to_hypotheses(connect, can_edit, items)
         if message:
             st.session_state["bs_sheet_flash"] = message
             st.rerun()
@@ -948,8 +931,7 @@ def _start_batch(connect, actor: str, can_edit: bool, dispatch_token: str, repo:
                    "Его можно запустить вручную: GitHub → Actions → «Best Seller — поиск по списку».")
 
 
-def _render_batch_live(connect, actor: str, can_edit: bool, dispatch_token: str, repo: str,
-                       sheet_writer=None) -> None:
+def _render_batch_live(connect, actor: str, can_edit: bool, dispatch_token: str, repo: str) -> None:
     flash = st.session_state.pop("bs_batch_flash", None)
     if flash:
         st.success(flash)
@@ -1001,7 +983,7 @@ def _render_batch_live(connect, actor: str, can_edit: bool, dispatch_token: str,
         csv_col, write_col = st.columns([1, 3], vertical_alignment="center")
         csv_col.download_button("Выгрузить в CSV", batch_csv(shown), file_name="best_seller_search.csv",
                                 mime="text/csv", key="bs_batch_csv_out", disabled=not shown)
-        if write_col.button("Записать все с высоким приоритетом в таблицу гипотез", key="bs_batch_write",
+        if write_col.button("Добавить все с высоким приоритетом в таблицу гипотез", key="bs_batch_write",
                             disabled=not can_edit):
             try:
                 items = best_seller_store.unwritten_high(connect)
@@ -1009,13 +991,13 @@ def _render_batch_live(connect, actor: str, can_edit: bool, dispatch_token: str,
                 st.error(str(exc))
                 items = None
             if items is not None:
-                message = write_to_sheet(connect, sheet_writer, items) if items else None
+                message = add_to_hypotheses(connect, can_edit, items) if items else None
                 if message:
                     st.session_state["bs_batch_flash"] = message
                     st.rerun()
                 elif not items:
-                    st.info("Нечего записывать: подходящих подкатегорий с высоким приоритетом, ещё не записанных "
-                            "в таблицу, нет.")
+                    st.info("Нечего добавлять: подходящих подкатегорий с высоким приоритетом, ещё не добавленных "
+                            "в таблицу гипотез, нет.")
     st.markdown(
         '<p class="bs-legend">Подробный результат по ASIN (подкатегории и критерии К1–К4) — в режиме «Один ASIN»: '
         'введите тот же ASIN, там покажется последний поиск. Если ASIN уже в топ-3 своей подкатегории, поиск не '
@@ -1024,7 +1006,7 @@ def _render_batch_live(connect, actor: str, can_edit: bool, dispatch_token: str,
 
 
 def _render_batch(connect=None, actor: str = "", can_edit: bool = False, dispatch_token: str = "",
-                  repo: str = "", sheet_writer=None) -> None:
+                  repo: str = "") -> None:
     st.markdown('<p class="section-title">Поиск подкатегорий: список ASIN</p>', unsafe_allow_html=True)
     st.markdown(
         '<p class="section-note">Один поиск на много ASIN. Топ-100 каждой подкатегории берётся один раз и хранится '
@@ -1033,7 +1015,7 @@ def _render_batch(connect=None, actor: str = "", can_edit: bool = False, dispatc
     )
     _render_watchlist(connect, actor, can_edit)
     if _batch_ready(connect):
-        _render_batch_live(connect, actor, can_edit, dispatch_token, repo, sheet_writer)
+        _render_batch_live(connect, actor, can_edit, dispatch_token, repo)
         return
     st.info("Таблиц поиска в базе ещё нет (best_seller_db/002_search.sql) или база не подключена: ниже пример из "
             "макета.")
@@ -1071,7 +1053,7 @@ def _render_batch(connect=None, actor: str = "", can_edit: bool = False, dispatc
         else:
             st.info("Под фильтр ничего не подходит.")
         write_col, csv_out_col, page_col = st.columns([1.6, 0.9, 1.6], vertical_alignment="center")
-        _soon(write_col, "Записать все с высоким приоритетом в таблицу гипотез", "bs_batch_write", WRITE_LATER)
+        _soon(write_col, "Добавить все с высоким приоритетом в таблицу гипотез", "bs_batch_write", WRITE_LATER)
         _soon(csv_out_col, "Выгрузить в CSV", "bs_batch_csv_out")
         page_col.markdown(
             f'<div class="bs-meta" style="text-align:right">Показано {len(rows)} из {DEMO_BATCH_TOTAL} · '
@@ -1087,56 +1069,69 @@ def _render_batch(connect=None, actor: str = "", can_edit: bool = False, dispatc
     )
 
 
-SHEET_VIEWS = ("Best Seller (авто)", "Основной лист (Артур)")
+HYPO_COLUMNS = ["Подкатегория", "Ссылка", "Товар-кандидат", "ASIN", "Страна", "Родительская категория",
+                "Релевантность", "BSR лидера", "Наш целевой BSR", "Приоритет", "Проверено", "Кто искал"]
 
 
-def _render_hypotheses(sheet_reader) -> None:
-    """Таблица гипотез из Google внутри дашборда (только чтение): лист, куда пишет дашборд, и основной лист."""
-    st.markdown('<p class="section-title">Таблица гипотез</p>', unsafe_allow_html=True)
-    st.markdown('<p class="section-note">То, что записано в Google-таблицу «' + escape(SHEET_NAME) + '». Здесь только '
-                'просмотр: записывать подкатегории — кнопками в режимах «Один ASIN» и «Список ASIN».</p>',
-                unsafe_allow_html=True)
-    if sheet_reader is None:
-        st.info(NO_SHEET_KEY)
-        return
-    left, mid, right = st.columns([2, 2, 1], vertical_alignment="bottom")
-    view = left.radio("Лист", SHEET_VIEWS, horizontal=True, key="bs_sheet_view", label_visibility="collapsed")
-    query = mid.text_input("Поиск по таблице", placeholder="ASIN или часть названия…", key="bs_sheet_query")
-    refresh = right.button("Обновить", key="bs_sheet_refresh")
-    tab = best_seller_sheet.TAB if view == SHEET_VIEWS[0] else best_seller_sheet.MAIN
-    cache = st.session_state.setdefault("bs_sheet_cache", {})
-    if refresh or tab not in cache:
-        try:
-            cache[tab] = sheet_reader.read(tab)
-        except best_seller_sheet.SheetError as exc:
-            st.error(str(exc))
-            return
-    header, rows = cache[tab]
-    st.markdown(f'<a href="{escape(sheet_reader.url)}" target="_blank" rel="noopener noreferrer">Открыть таблицу в '
-                'Google</a>', unsafe_allow_html=True)
-    if not header or not rows:
-        st.info("На этом листе пока нет строк." if tab == best_seller_sheet.MAIN else
-                "Лист «" + best_seller_sheet.TAB + "» пока пуст: записей из дашборда ещё не было.")
-        return
-    needle = query.strip().lower()
-    shown = [r for r in rows if not needle or needle in " ".join(r).lower()]
+def hypothesis_frame(rows: Sequence[dict]):
+    """Таблица гипотез для показа и выгрузки: столбцы из SOP-AMZ-001 (раздел 7) плюс название и страна."""
     import pandas as pd
 
-    frame = pd.DataFrame(shown, columns=header)
-    st.caption(f"Строк: {len(shown)} из {len(rows)}")
-    st.dataframe(frame, hide_index=True, width="stretch",
-                 column_config={header[0]: st.column_config.LinkColumn(header[0], display_text=r".*/(\d+)/?$")})
+    data = []
+    for r in rows:
+        data.append([r["name"] or r["node"], node_url(pairs_store.DOMAIN_BY_MARKET.get(r["market"]), r["dept"], r["node"]),
+                     r["title"], r["asin"], r["market"], r["path"],
+                     best_seller.RELEVANCE_LABELS.get(r["relevance"], ""), r["leader_bsr"], r["target_bsr"],
+                     r["priority"] or "", fmt_when(r["checked"]), r["actor"]])
+    return pd.DataFrame(data, columns=HYPO_COLUMNS)
+
+
+def _render_hypotheses(connect) -> None:
+    """Таблица гипотез внутри дашборда: подкатегории, добавленные кнопками «Добавить в таблицу гипотез»."""
+    st.markdown('<p class="section-title">Таблица гипотез</p>', unsafe_allow_html=True)
+    st.markdown('<p class="section-note">Подкатегории, где листинг может получить плашку #1 Best Seller. Они '
+                'попадают сюда кнопками «Добавить в таблицу гипотез» в режимах «Один ASIN» и «Список ASIN». Столбцы '
+                'как в SOP-AMZ-001 (раздел 7).</p>', unsafe_allow_html=True)
+    if connect is None:
+        st.info(NO_DATABASE)
+        return
+    try:
+        rows = best_seller_store.hypotheses(connect) if best_seller_store.search_tables_exist(connect) else None
+    except best_seller_store.BestSellerStoreError as exc:
+        st.error(str(exc))
+        return
+    if rows is None:
+        st.info(NO_TABLE)
+        return
+    if not rows:
+        st.info("В таблице гипотез пока пусто: найдите подкатегории и добавьте подходящие.")
+        return
+    query_col, prio_col, _ = st.columns([2, 2, 2], vertical_alignment="bottom")
+    query = query_col.text_input("Поиск по таблице", placeholder="ASIN, товар или подкатегория…",
+                                 key="bs_hypo_query").strip().lower()
+    priorities = ["Все"] + sorted({r["priority"] for r in rows if r["priority"]})
+    priority = prio_col.selectbox("Приоритет", priorities, key="bs_hypo_priority")
+    frame = hypothesis_frame(rows)
+    mask = frame.apply(lambda row: (not query or query in " ".join(str(v) for v in row).lower())
+                       and (priority == "Все" or row["Приоритет"] == priority), axis=1)
+    shown = frame[mask]
+    st.caption(f"Строк: {len(shown)} из {len(frame)}")
+    st.dataframe(shown, hide_index=True, width="stretch",
+                 column_config={"Ссылка": st.column_config.LinkColumn("Ссылка", display_text="открыть")})
+    st.download_button("Выгрузить в CSV", shown.to_csv(index=False).encode("utf-8-sig"),
+                       file_name="best_seller_hypotheses.csv", mime="text/csv", key="bs_hypo_csv",
+                       disabled=shown.empty)
 
 
 def render(connect=None, actor: str = "", can_edit: bool = False, token: str = "", dispatch_token: str = "",
-           repo: str = "", sheet_writer=None, sheet_reader=None) -> None:
+           repo: str = "") -> None:
     """connect — подключение к базе дашборда (таблицы раздела — в схеме best_seller; None — нет базы);
     can_edit — может ли менять список."""
     st.markdown(_CSS, unsafe_allow_html=True)
     mode = st.radio("Режим", MODES, horizontal=True, key="bs_mode", label_visibility="collapsed")
     if mode == MODES[0]:
-        _render_single(connect, actor, can_edit, token, sheet_writer)
+        _render_single(connect, actor, can_edit, token)
     elif mode == MODES[2]:
-        _render_hypotheses(sheet_reader)
+        _render_hypotheses(connect)
     else:
-        _render_batch(connect, actor, can_edit, dispatch_token, repo, sheet_writer)
+        _render_batch(connect, actor, can_edit, dispatch_token, repo)

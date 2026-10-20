@@ -339,12 +339,34 @@ def latest_search(connect: Connect, market: str, asin: str) -> Optional[dict]:
             "finished_at": finished, "results": [dict(zip(keys, row)) for row in results]}
 
 
-def mark_written(connect: Connect, search_id: int, nodes: Sequence[str]) -> int:
-    """Отметка «записано в таблицу гипотез» — чтобы не писать одно и то же второй раз."""
+def mark_written(connect: Connect, search_id: int, nodes: Sequence[str], *, actor_role: Optional[str]) -> int:
+    """Добавляет подкатегории в таблицу гипотез раздела (флаг written_to_sheet)."""
+    access.require_role(actor_role, access.ROLE_EDITOR)
     return len(_run(connect, """
         UPDATE best_seller.search_results SET written_to_sheet = TRUE
         WHERE search_id = %s AND node = ANY(%s::text[]) RETURNING node;
         """, (search_id, list(nodes)), fetch=True))
+
+
+def hypotheses(connect: Connect) -> List[dict]:
+    """Таблица гипотез: подкатегории, добавленные в неё; по каждой паре (страна, ASIN, подкатегория) — из самого
+    свежего поиска. Свежие сверху."""
+    rows = _run(connect, """
+        SELECT market, asin, title, node, name, path, dept, leader_bsr, target_bsr, relevance, priority, checked, actor
+        FROM (
+            SELECT DISTINCT ON (s.marketplace, s.asin, r.node) s.marketplace AS market, s.asin, s.title, r.node,
+                   r.name, r.path, c.dept, r.leader_bsr, s.target_bsr, r.relevance, r.priority,
+                   COALESCE(s.finished_at, s.started_at) AS checked, s.actor, s.id
+            FROM best_seller.search_results r
+            JOIN best_seller.searches s ON s.id = r.search_id
+            LEFT JOIN best_seller.node_cache c ON c.marketplace = s.marketplace AND c.node = r.node
+            WHERE r.written_to_sheet
+            ORDER BY s.marketplace, s.asin, r.node, s.started_at DESC, s.id DESC
+        ) t ORDER BY checked DESC, id DESC;
+        """, fetch=True)
+    keys = ("market", "asin", "title", "node", "name", "path", "dept", "leader_bsr", "target_bsr", "relevance",
+            "priority", "checked", "actor")
+    return [dict(zip(keys, row)) for row in rows]
 
 
 def unwritten_high(connect: Connect) -> List[dict]:
