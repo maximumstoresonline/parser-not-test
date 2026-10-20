@@ -555,6 +555,7 @@ def _render_single(connect=None, actor: str = "", can_edit: bool = False, token:
             st.warning(LINK_HINT)
         if why_not and items:
             st.caption(why_not)
+    _render_history(connect)
     if not items:
         return
     try:
@@ -583,6 +584,35 @@ def _render_single(connect=None, actor: str = "", can_edit: bool = False, token:
              domain=pairs_store.DOMAIN_BY_MARKET.get(found["market"]), target=found.get("target_bsr"))
     _legend()
     _relevance_review(connect, found, can_edit)
+
+
+def history_label(row: dict) -> str:
+    status = _STATUS_LABELS.get(row["status"], row["status"])
+    if row["status"] == "done":
+        status = (f"подходят {row['suitable']}" if row["suitable"]
+                  else f"ждут К3: {row['pending']}" if row["pending"] else "нет подходящих")
+    return f"{row['asin']} · {row['market']} · {status} · {fmt_when(row.get('finished_at') or row.get('started_at')) or '–'}"
+
+
+def _open_from_history(url: str) -> None:
+    st.session_state["bs_link"] = url
+
+
+def _render_history(connect) -> None:
+    """Последние 10 поисков (и из режима «Один ASIN», и из списка): клик подставляет ссылку и показывает результат."""
+    if connect is None:
+        return
+    try:
+        rows = best_seller_store.recent_searches(connect, 10)
+    except best_seller_store.BestSellerStoreError:
+        return
+    if not rows:
+        return
+    with st.expander(f"История поисков (последние {len(rows)})"):
+        for i, row in enumerate(rows):
+            url = asin_url(pairs_store.DOMAIN_BY_MARKET.get(row["market"]), row["asin"])
+            st.button(history_label(row), key=f"bs_hist_{i}", disabled=url is None, on_click=_open_from_history,
+                      args=(url,), help=row.get("title") or None)
 
 
 _RELEVANCE_ORDER = (best_seller.RELEVANT, best_seller.SEMI_RELEVANT, best_seller.RISKY, best_seller.IRRELEVANT)

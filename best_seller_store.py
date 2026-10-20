@@ -275,6 +275,23 @@ def fail_search(connect: Connect, search_id: int, message: str) -> None:
          (message[:500], search_id))
 
 
+def recent_searches(connect: Connect, limit: int = 10) -> List[dict]:
+    """История: последние поиски, по одному (последнему) на страну и ASIN, свежие сверху."""
+    rows = _run(connect, """
+        SELECT marketplace, asin, title, status, our_bsr, started_at, finished_at, suitable, pending FROM (
+            SELECT DISTINCT ON (s.marketplace, s.asin) s.marketplace, s.asin, s.title, s.status, s.our_bsr,
+                   s.started_at, s.finished_at, s.id,
+                   (SELECT count(*) FROM best_seller.search_results r WHERE r.search_id = s.id
+                    AND r.status = 'suitable') AS suitable,
+                   (SELECT count(*) FROM best_seller.search_results r WHERE r.search_id = s.id
+                    AND r.status = 'pending') AS pending
+            FROM best_seller.searches s ORDER BY s.marketplace, s.asin, s.started_at DESC, s.id DESC
+        ) t ORDER BY COALESCE(finished_at, started_at) DESC, id DESC LIMIT %s;
+        """, (max(1, min(int(limit), 50)),), fetch=True)
+    keys = ("market", "asin", "title", "status", "our_bsr", "started_at", "finished_at", "suitable", "pending")
+    return [dict(zip(keys, row)) for row in rows]
+
+
 def batch_rows(connect: Connect) -> List[dict]:
     """Активные ASIN списка с последним поиском по каждому и лучшей подходящей подкатегорией."""
     rows = _run(connect, """
