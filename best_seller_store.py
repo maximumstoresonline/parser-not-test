@@ -214,8 +214,8 @@ def save_search(connect: Connect, result, *, actor_role: Optional[str], actor: s
 # --- очередь поиска по списку (выполняет best_seller_batch.py в GitHub Actions) ------------------------------------
 
 _ENQUEUE_SQL = """
-INSERT INTO best_seller.searches (marketplace, asin, actor, status)
-SELECT a.marketplace, a.asin, %s, 'queued' FROM best_seller.asins a
+INSERT INTO best_seller.searches (marketplace, asin, actor, status, target_bsr)
+SELECT a.marketplace, a.asin, %s, 'queued', a.target_bsr FROM best_seller.asins a
 WHERE a.active
   AND NOT EXISTS (SELECT 1 FROM best_seller.searches s WHERE s.marketplace = a.marketplace AND s.asin = a.asin
                   AND s.status IN ('queued', 'running'))
@@ -223,6 +223,33 @@ WHERE a.active
                              AND s.asin = a.asin AND s.status IN ('done', 'not_needed')))
 RETURNING id;
 """
+
+
+MAX_TARGET = 10_000_000
+
+
+def ensure_target_column(connect: Connect) -> None:
+    """Столбец цели у списка ASIN (best_seller_db/003_target.sql) — применяется сам, повторно безопасно."""
+    _run(connect, "ALTER TABLE best_seller.asins ADD COLUMN IF NOT EXISTS target_bsr INTEGER "
+                  "CHECK (target_bsr IS NULL OR target_bsr > 0);")
+
+
+def set_targets(connect: Connect, targets: Dict[Key, Optional[int]], *, actor_role: Optional[str]) -> int:
+    """Целевой BSR по (страна, ASIN); None — снять цель (будет текущий BSR товара). Возвращает число строк."""
+    access.require_role(actor_role, access.ROLE_EDITOR)
+    for value in targets.values():
+        if value is not None and not (0 < int(value) <= MAX_TARGET):
+            raise BestSellerStoreError(f"Целевой BSR должен быть от 1 до {MAX_TARGET:,}.".replace(",", " "))
+    if not targets:
+        return 0
+    keys = list(targets)
+    rows = _run(connect, """
+        UPDATE best_seller.asins a SET target_bsr = t.target
+        FROM unnest(%s::text[], %s::text[], %s::int[]) AS t(market, asin, target)
+        WHERE a.marketplace = t.market AND a.asin = t.asin AND a.target_bsr IS DISTINCT FROM t.target
+        RETURNING a.asin;
+        """, ([k[0] for k in keys], [k[1] for k in keys], [targets[k] for k in keys]), fetch=True)
+    return len(rows)
 
 
 def enqueue_searches(connect: Connect, *, actor_role: Optional[str], actor: str, only_new: bool = True) -> int:
@@ -238,12 +265,12 @@ def claim_next(connect: Connect) -> Optional[dict]:
         UPDATE best_seller.searches SET status = 'running', started_at = now()
         WHERE id = (SELECT id FROM best_seller.searches WHERE status = 'queued' ORDER BY id
                     FOR UPDATE SKIP LOCKED LIMIT 1)
-        RETURNING id, marketplace, asin, actor;
+        RETURNING id, marketplace, asin, actor, target_bsr;
         """, fetch=True)
     if not rows:
         return None
-    sid, market, asin, actor = rows[0]
-    return {"id": sid, "market": market, "asin": asin, "actor": actor}
+    sid, market, asin, actor, target = rows[0]
+    return {"id": sid, "market": market, "asin": asin, "actor": actor, "target": target}
 
 
 def recover_stale(connect: Connect, minutes: int = 90) -> int:
@@ -298,7 +325,7 @@ def batch_rows(connect: Connect) -> List[dict]:
         SELECT a.marketplace, a.asin, s.status, s.our_bsr, s.title, s.error, s.own,
                (SELECT count(*) FROM best_seller.search_results r WHERE r.search_id = s.id AND r.status = 'suitable'),
                (SELECT count(*) FROM best_seller.search_results r WHERE r.search_id = s.id AND r.status = 'pending'),
-               b.name, b.leader_bsr, b.priority, s.started_at, s.finished_at, s.requests, s.actor
+               b.name, b.leader_bsr, b.priority, s.started_at, s.finished_at, s.requests, s.actor, a.target_bsr
         FROM best_seller.asins a
         LEFT JOIN LATERAL (SELECT * FROM best_seller.searches x WHERE x.marketplace = a.marketplace AND x.asin = a.asin
                            ORDER BY x.started_at DESC, x.id DESC LIMIT 1) s ON TRUE
@@ -309,7 +336,7 @@ def batch_rows(connect: Connect) -> List[dict]:
         WHERE a.active ORDER BY a.marketplace, a.asin;
         """, fetch=True)
     keys = ("market", "asin", "status", "our_bsr", "title", "error", "own", "suitable", "pending", "best", "leader_bsr",
-            "priority", "started_at", "finished_at", "requests", "actor")
+            "priority", "started_at", "finished_at", "requests", "actor", "target")
     return [dict(zip(keys, row)) for row in rows]
 
 

@@ -116,11 +116,12 @@ def test_button_adds_only_the_selected_and_not_yet_added(monkeypatch):
 def test_batch_button_adds_all_high_priority(monkeypatch):
     added = []
     row = {"market": "US", "asin": "B0GNBSDL65", "status": "done", "our_bsr": 1, "title": "", "error": "", "own": [],
-           "suitable": 1, "pending": 0, "best": "x", "leader_bsr": 5, "priority": "высокий", "started_at": None,
+           "suitable": 1, "pending": 0, "target": None, "best": "x", "leader_bsr": 5, "priority": "высокий", "started_at": None,
            "finished_at": None, "requests": 3, "actor": "A"}
     monkeypatch.setattr(store, "table_exists", lambda c: True)
     monkeypatch.setattr(store, "search_tables_exist", lambda c: True)
     monkeypatch.setattr(store, "list_asins", lambda c: [])
+    monkeypatch.setattr(store, "ensure_target_column", lambda c: None)
     monkeypatch.setattr(store, "batch_rows", lambda c: [row])
     monkeypatch.setattr(store, "unwritten_high", lambda c: [{**ROW, "search_id": 7}, {**ROW, "search_id": 8,
                                                                                     "node": "5"}])
@@ -137,11 +138,13 @@ def test_batch_button_adds_all_high_priority(monkeypatch):
 
 def test_batch_button_says_when_there_is_nothing_to_add(monkeypatch):
     row = {"market": "US", "asin": "B0GNBSDL65", "status": "done", "our_bsr": 1, "title": "", "error": "", "own": [],
-           "suitable": 0, "pending": 0, "best": None, "leader_bsr": None, "priority": None, "started_at": None,
+           "suitable": 0, "pending": 0, "target": None, "best": None, "leader_bsr": None, "priority": None,
+           "started_at": None,
            "finished_at": None, "requests": 0, "actor": ""}
     monkeypatch.setattr(store, "table_exists", lambda c: True)
     monkeypatch.setattr(store, "search_tables_exist", lambda c: True)
     monkeypatch.setattr(store, "list_asins", lambda c: [])
+    monkeypatch.setattr(store, "ensure_target_column", lambda c: None)
     monkeypatch.setattr(store, "batch_rows", lambda c: [row])
     monkeypatch.setattr(store, "unwritten_high", lambda c: [])
     at = AppTest.from_string(SCRIPT)

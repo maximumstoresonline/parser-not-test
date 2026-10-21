@@ -72,6 +72,7 @@ class BatchRow:
     status: str
     when: Optional[str] = None  # когда проверен (или поставлен в очередь), по Киеву
     requests: Optional[int] = None
+    target: Optional[int] = None  # целевой BSR из списка (None — текущий BSR товара)
 
 
 # Пример из макета: листинг B0GNBSDL65 (Scrapingdog), подкатегории и BSR лидеров — из SOP-AMZ-001.
@@ -716,11 +717,12 @@ def _batch_table(rows: Sequence[BatchRow]) -> str:
             status += '<span class="bs-retry">повторить</span>'
         body.append(
             f"<tr><td>{asin}</td><td>{escape(row.market)}</td><td>{escape(row.group)}</td><td class='bs-num'>{escape(row.our_bsr or '–')}</td>"
+            f"<td class='bs-num'>{fmt_int(row.target) if row.target else '–'}</td>"
             f"<td>{best}</td><td class='bs-num'>{fmt_int(row.leader_bsr)}</td>"
             f"<td class='bs-num'><b>{'–' if row.suitable is None else row.suitable}</b></td>"
             f"<td>{priority}</td><td>{status}</td><td class='bs-sub'>{escape(row.when or '–')}</td></tr>"
         )
-    head = ("<tr><th>ASIN</th><th>Страна</th><th>Группа</th><th class='bs-num'>Наш BSR</th><th>Лучшая подкатегория</th>"
+    head = ("<tr><th>ASIN</th><th>Страна</th><th>Группа</th><th class='bs-num'>Наш BSR</th><th class='bs-num'>Цель BSR</th><th>Лучшая подкатегория</th>"
             "<th class='bs-num'>BSR лидера</th><th class='bs-num'>Подходят</th><th>Приоритет</th><th>Статус</th><th>Проверен</th></tr>")
     return f'<table class="bs-table"><thead>{head}</thead><tbody>{"".join(body)}</tbody></table>'
 
@@ -871,7 +873,7 @@ def batch_row_from_db(row: dict) -> BatchRow:
         best = row["error"] or None
     return BatchRow(row["asin"], row["market"], "", fmt_int(row["our_bsr"]) if row["our_bsr"] else None, best,
                     row["leader_bsr"], row["suitable"] if row["status"] == "done" else None, row["priority"], status,
-                    fmt_when(row.get("finished_at") or row.get("started_at")), row.get("requests"))
+                    fmt_when(row.get("finished_at") or row.get("started_at")), row.get("requests"), row.get("target"))
 
 
 def batch_counts(rows: Sequence[BatchRow]) -> Tuple[int, int, int, int, int]:
@@ -890,10 +892,10 @@ def batch_csv(rows: Sequence[BatchRow]) -> str:
 
     out = io.StringIO()
     writer = csv.writer(out)
-    writer.writerow(["ASIN", "Страна", "Наш BSR", "Лучшая подкатегория", "BSR лидера", "Подходят", "Приоритет",
+    writer.writerow(["ASIN", "Страна", "Наш BSR", "Целевой BSR", "Лучшая подкатегория", "BSR лидера", "Подходят", "Приоритет",
                      "Статус", "Проверен (Киев)", "Запросов ScrapingDog"])
     for r in rows:
-        writer.writerow([r.asin, r.market, r.our_bsr or "", r.best or "", r.leader_bsr or "",
+        writer.writerow([r.asin, r.market, r.our_bsr or "", r.target or "", r.best or "", r.leader_bsr or "",
                          "" if r.suitable is None else r.suitable, r.priority or "", r.status, r.when or "",
                          "" if r.requests is None else r.requests])
     return out.getvalue()
@@ -931,7 +933,53 @@ def _start_batch(connect, actor: str, can_edit: bool, dispatch_token: str, repo:
                    "Его можно запустить вручную: GitHub → Actions → «Best Seller — поиск по списку».")
 
 
+def targets_to_save(raw: Sequence[dict], edited: Sequence[dict]) -> dict:
+    """Что изменилось в таблице целей: {(страна, ASIN): цель или None}. 0 и пусто — «текущий BSR» (None)."""
+    current = {(r["market"], r["asin"]): r.get("target") for r in raw}
+    changes = {}
+    for row in edited:
+        key = (row["Страна"], row["ASIN"])
+        value = row["Целевой BSR"]
+        value = None if value is None or value != value or int(value) == 0 else int(value)  # value != value — NaN
+        if key in current and current[key] != value:
+            changes[key] = value
+    return changes
+
+
+def _targets_editor(connect, raw: Sequence[dict], can_edit: bool) -> None:
+    import pandas as pd
+
+    with st.expander("Целевой BSR по ASIN"):
+        st.caption("Целевой BSR — BSR после восстановления, с ним сравниваются лидеры подкатегорий (SOP, шаг 2: "
+                   "например 55 000–60 000). 0 — брать текущий BSR товара. После смены цели запустите поиск заново, "
+                   "сняв галочку «Только без результата».")
+        frame = pd.DataFrame([{"ASIN": r["asin"], "Страна": r["market"], "Наш BSR": r["our_bsr"],
+                               "Целевой BSR": r.get("target") or 0} for r in raw])
+        edited = st.data_editor(
+            frame, key="bs_targets_editor", hide_index=True, width="stretch",
+            disabled=True if not can_edit else ["ASIN", "Страна", "Наш BSR"],
+            column_config={"Целевой BSR": st.column_config.NumberColumn(
+                "Целевой BSR", min_value=0, max_value=best_seller_store.MAX_TARGET, step=1000, format="%d")})
+        changes = targets_to_save(raw, edited.to_dict("records"))
+        if st.button(f"Сохранить цели ({len(changes)})" if changes else "Сохранить цели", key="bs_targets_save",
+                     disabled=not can_edit or not changes):
+            try:
+                best_seller_store.set_targets(connect, changes, actor_role=best_seller_role(can_edit))
+            except (best_seller_store.BestSellerStoreError, access.AccessDenied) as exc:
+                st.error(str(exc))
+            else:
+                st.session_state["bs_batch_flash"] = f"Целей сохранено: {len(changes)}."
+                st.rerun()
+
+
 def _render_batch_live(connect, actor: str, can_edit: bool, dispatch_token: str, repo: str) -> None:
+    if not st.session_state.get("bs_schema_003"):
+        try:
+            best_seller_store.ensure_target_column(connect)
+        except best_seller_store.BestSellerStoreError:
+            st.error("Не удалось добавить столбец целевого BSR в базу: примените best_seller_db/003_target.sql.")
+            return
+        st.session_state["bs_schema_003"] = True
     flash = st.session_state.pop("bs_batch_flash", None)
     if flash:
         st.success(flash)
@@ -953,6 +1001,7 @@ def _render_batch_live(connect, actor: str, can_edit: bool, dispatch_token: str,
     if not rows:
         st.info("В списке пока нет активных ASIN: добавьте их выше.")
         return
+    _targets_editor(connect, raw, can_edit)
     done, with_, without, errors, active = batch_counts(rows)
     total = len(rows)
     finished = [r["finished_at"] for r in raw if r.get("finished_at")]

@@ -28,7 +28,8 @@ def process_one(connect, job: dict, *, search: Callable, fetch_page: Callable) -
     market, asin = job["market"], job["asin"]
     try:
         result = search(
-            asin, market, cache=store.DbNodeCache(connect), branches=bss.BRANCHES_BY_MARKET.get(market),
+            asin, market, cache=store.DbNodeCache(connect), target_bsr=job.get("target"),
+            branches=bss.BRANCHES_BY_MARKET.get(market),
             keep=bss.keyword_filter,
             fetch_product=lambda a, d: bss.product_from_page(fetch_page(bss.product_url(market, a))),
             fetch_page=fetch_page)

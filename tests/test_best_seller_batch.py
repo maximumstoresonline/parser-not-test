@@ -34,8 +34,9 @@ def test_enqueue_all_passes_only_new_false():
 
 
 def test_claim_next_takes_one_row_without_clashing_with_other_workers():
-    db = FakeDb([(5, "US", "B0GNBSDL65", "Anna")])
-    assert store.claim_next(db.connect) == {"id": 5, "market": "US", "asin": "B0GNBSDL65", "actor": "Anna"}
+    db = FakeDb([(5, "US", "B0GNBSDL65", "Anna", 58000)])
+    assert store.claim_next(db.connect) == {"id": 5, "market": "US", "asin": "B0GNBSDL65", "actor": "Anna",
+                                            "target": 58000}
     assert "SKIP LOCKED" in db.executed[0][0]
     assert store.claim_next(FakeDb([]).connect) is None
 
@@ -105,7 +106,7 @@ def test_batch_dispatch_calls_its_own_workflow_without_inputs():
 
 def db_row(asin, status, **extra):
     row = {"market": "US", "asin": asin, "status": status, "our_bsr": 91233, "title": "", "error": "", "own": [],
-           "suitable": 0, "pending": 0, "best": None, "leader_bsr": None, "priority": None}
+           "suitable": 0, "pending": 0, "target": None, "best": None, "leader_bsr": None, "priority": None}
     return {**row, **extra}
 
 
@@ -139,6 +140,7 @@ def start(monkeypatch, can_edit=True, ready=True):
     monkeypatch.setattr(store, "search_tables_exist", lambda c: ready)
     monkeypatch.setattr(store, "list_asins", lambda c: [])
     monkeypatch.setattr(store, "batch_rows", lambda c: ROWS)
+    monkeypatch.setattr(store, "ensure_target_column", lambda c: None)
     at = AppTest.from_string(SCRIPT.replace("CAN_EDIT", str(can_edit)))
     at.session_state["bs_mode"] = ui.MODES[1]
     return at.run(timeout=30)
@@ -190,3 +192,53 @@ def test_pending_subcategories_are_not_reported_as_no_match():
     row = ui.batch_row_from_db(db_row("B0GNBSDL65", "done", pending=3))
     assert row.best == "ждут оценки К3: 3" and row.suitable == 0
     assert ui.batch_row_from_db(db_row("B0GNBSDL65", "done")).best == "нет подходящих"
+
+
+# --- целевой BSR по ASIN ---------------------------------------------------------------------------------------
+
+def test_targets_to_save_lists_only_real_changes():
+    raw = [{"market": "US", "asin": "A", "target": None}, {"market": "US", "asin": "B", "target": 60000},
+           {"market": "US", "asin": "C", "target": 55000}]
+    edited = [{"Страна": "US", "ASIN": "A", "Целевой BSR": 0},          # было «текущий», осталось
+              {"Страна": "US", "ASIN": "B", "Целевой BSR": 0},          # сняли цель
+              {"Страна": "US", "ASIN": "C", "Целевой BSR": 58000.0},    # новая цель
+              {"Страна": "DE", "ASIN": "X", "Целевой BSR": 5}]          # строки нет в списке
+    assert ui.targets_to_save(raw, edited) == {("US", "B"): None, ("US", "C"): 58000}
+    assert ui.targets_to_save(raw, [{"Страна": "US", "ASIN": "A", "Целевой BSR": float("nan")}]) == {}
+
+
+def test_set_targets_needs_editor_and_a_sane_number():
+    db = FakeDb([("B0GNBSDL65",)])
+    assert store.set_targets(db.connect, {("US", "B0GNBSDL65"): 58000}, actor_role=access.ROLE_EDITOR) == 1
+    assert db.executed[0][1] == (["US"], ["B0GNBSDL65"], [58000])
+    with pytest.raises(access.AccessDenied):
+        store.set_targets(db.connect, {("US", "B0GNBSDL65"): 1}, actor_role=None)
+    with pytest.raises(store.BestSellerStoreError):
+        store.set_targets(db.connect, {("US", "B0GNBSDL65"): 10**9}, actor_role=access.ROLE_EDITOR)
+    assert store.set_targets(db.connect, {}, actor_role=access.ROLE_EDITOR) == 0
+
+
+def test_enqueue_copies_the_target_and_worker_uses_it(monkeypatch):
+    db = FakeDb([(1,)])
+    store.enqueue_searches(db.connect, actor_role=access.ROLE_EDITOR, actor="A")
+    assert "a.target_bsr" in db.executed[0][0]
+    seen = {}
+    monkeypatch.setattr(store, "DbNodeCache", lambda c: object())
+    monkeypatch.setattr(store, "finish_search", lambda c, i, r: None)
+    worker.process_one(None, {"id": 1, "market": "US", "asin": "B0GNBSDL65", "actor": "A", "target": 58000},
+                       search=lambda *a, **k: seen.update(k) or Result(), fetch_page=lambda u: None)
+    assert seen["target_bsr"] == 58000
+
+
+def test_table_shows_the_target_and_ensure_runs_once(monkeypatch):
+    calls = []
+    monkeypatch.setattr(store, "table_exists", lambda c: True)
+    monkeypatch.setattr(store, "search_tables_exist", lambda c: True)
+    monkeypatch.setattr(store, "list_asins", lambda c: [])
+    monkeypatch.setattr(store, "ensure_target_column", lambda c: calls.append(1))
+    monkeypatch.setattr(store, "batch_rows", lambda c: [db_row("B0GNBSDL65", "done", target=58000, suitable=1)])
+    at = AppTest.from_string(SCRIPT.replace("CAN_EDIT", "True"))
+    at.session_state["bs_mode"] = ui.MODES[1]
+    at.run(timeout=30).run(timeout=30)
+    assert not at.exception and calls == [1]
+    assert any("58 000" in m.value for m in at.markdown)
