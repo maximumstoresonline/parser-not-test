@@ -492,7 +492,7 @@ def _run_search(connect, market: str, asin: str, target: Optional[int], actor: s
 
     fetch_page = lambda url: scraping.scrape_page(url, token=token)  # noqa: E731
     result = bss.search(asin, market, cache=best_seller_store.DbNodeCache(connect), target_bsr=target,
-                        branches=bss.BRANCHES_BY_MARKET.get(market), keep=bss.keyword_filter,
+                        branches=bss.BRANCHES_BY_MARKET.get(market), keep=bss.keyword_filter, derive_branches=True,
                         fetch_product=lambda a, d: bss.product_from_page(fetch_page(bss.product_url(market, a))),
                         fetch_page=fetch_page)
     best_seller_store.save_search(connect, result, actor_role=access.ROLE_EDITOR, actor=actor)

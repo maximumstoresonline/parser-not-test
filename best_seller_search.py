@@ -331,11 +331,25 @@ def _retrying(fetch: Callable, attempts: int) -> Callable:
     return call
 
 
+def derived_branches(product: dict, own: Sequence[Subcategory]) -> List[Branch]:
+    """Ветка для стран без заданных веток (всё, кроме US): родительские категории самого товара из хлебных крошек.
+    Берётся «дедушка» конечной подкатегории (для шапки: Women › Accessories › Hats & Caps › Beanies → Accessories),
+    как в SOP, шаг 5: оттуда обходятся все соседние конечные подкатегории. Номера узлов не зашиты — у каждой страны
+    они свои. Раздел Best Sellers (dept) — тот же, что у своих подкатегорий товара."""
+    dept = next((x.dept for x in own if x.dept), None)
+    own_nodes = {x.node for x in own}
+    nodes = [str(c.get("node")) for c in product.get("categories") or [] if isinstance(c, dict) and c.get("node")]
+    above = [n for n in nodes[1:] if n not in own_nodes]  # без корня раздела и без своих подкатегорий
+    if not dept or not above:
+        return []
+    return [Branch("", dept, above[-2] if len(above) >= 2 else above[-1])]
+
+
 def search(asin: str, market: str, *, fetch_product: ProductFetch, fetch_page: PageFetch, cache: NodeCache,
            target_bsr: Optional[int] = None, relevance: Optional[RelevanceFn] = None,
            now: Optional[datetime] = None, max_candidates: Optional[int] = None,
            attempts: int = ATTEMPTS, branches: Optional[Sequence[Branch]] = None,
-           keep: Optional[NameFilter] = None) -> SearchResult:
+           keep: Optional[NameFilter] = None, derive_branches: bool = False) -> SearchResult:
     """Подкатегории, где ASIN может стать #1 Best Seller. target_bsr — наш целевой BSR (по умолчанию — текущий).
     requests — сколько ответов получено (≈ кредитов; оборванные попытки ScrapingDog не оплачиваются)."""
     now = now or datetime.now(timezone.utc)
@@ -370,6 +384,8 @@ def search(asin: str, market: str, *, fetch_product: ProductFetch, fetch_page: P
 
     queue: List[Subcategory] = list(result.own)
     seen = {sub.node for sub in queue}
+    if not branches and derive_branches:  # страна без своих веток (П9 в SOP): ветка от категорий самого товара
+        branches = derived_branches(product, result.own)
     if branches:
         # Как в SOP: свои подкатегории + конечные подкатегории заданных веток; соседей своих не добавляем.
         leaves, used = walk_branches(market, branches, fetch_page=fetch_page, cache=cache, now=now, keep=keep,
@@ -454,6 +470,8 @@ def walk_branches(market: str, branches: Sequence[Branch], *, fetch_page: PageFe
             fetched += cost
             if info is None:
                 continue
+            if not path:  # у ветки из derived_branches нет заготовленного названия — берём со страницы
+                path = info.name or sub.name
             kids = [x for x in info.linked if x.node not in siblings and x.node != sub.node]
             if not kids:
                 leaves.append(Subcategory(sub.node, sub.dept, info.name or sub.name, path=path))

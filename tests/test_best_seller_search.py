@@ -11,13 +11,13 @@ NOW = datetime(2026, 10, 16, 12, 0, tzinfo=timezone.utc)
 OURS = "B0H9LK9T39"
 
 
-def bs_page(name, items, siblings=(), parents=()):
+def bs_page(name, items, siblings=(), parents=(), dept="fashion"):
     """Страница Best Sellers: места в data-client-recs-list, заголовки карточек, меню (родители и соседи)."""
     recs = json.dumps([{"id": asin, "metadataMap": {"render.zg.rank": str(rank)}} for rank, asin in items])
     cards = "".join(f'<div id="gridItemRoot"><div data-asin="{asin}"><div class="_cDEzb_p13n-sc-css-line-clamp-3_g3dy1">'
                     f"Title of {asin}</div></div></div>" for _, asin in items)
-    nav = "".join(f'<a href="/Best/zgbs/fashion/{n}/ref=zg_bs_unv_fashion_2_1">{label}</a>' for n, label in parents)
-    nav += "".join(f'<a href="/Best/zgbs/fashion/{n}/ref=zg_bs_nav_fashion_4_1">{label}</a>' for n, label in siblings)
+    nav = "".join(f'<a href="/Best/zgbs/{dept}/{n}/ref=zg_bs_unv_fashion_2_1">{label}</a>' for n, label in parents)
+    nav += "".join(f'<a href="/Best/zgbs/{dept}/{n}/ref=zg_bs_nav_fashion_4_1">{label}</a>' for n, label in siblings)
     return (f"<html><title>Amazon.com Best Sellers: Best {name}</title><body>{nav}"
             f'<div data-client-recs-list="{recs.replace(chr(34), "&quot;")}"></div>{cards}</body></html>')
 
@@ -324,3 +324,49 @@ def test_seasonal_sports_go_first_and_beanies_skip_garments():
     assert [x.node for x in leaves] == ["702", "703", "701"]
     assert s.keyword_filter("Merino Beanie", ["Pants", "Hoodies", "Accessories", "Hats"]) == ["Accessories", "Hats"]
     assert "Pants" in s.keyword_filter("Merino Base Layer", ["Pants", "Hoodies"])
+
+
+# --- другие страны: ветка от категорий самого товара ------------------------------------------------------------------
+
+DE_URL = "https://www.amazon.de/gp/bestsellers/apparel/"
+DE_PRODUCT = {
+    "title": "Merino Mütze",
+    "best_sellers_rank": [
+        {"rank": 50000, "category": "Bekleidung", "link": ""},
+        {"rank": 120, "category": "Beanie-Mützen", "link": "/gp/bestsellers/apparel/1001/"}],
+    # хлебные крошки: раздел › Damen › Accessoires › Mützen & Caps › Beanie-Mützen (своя)
+    "categories": [{"node": "100"}, {"node": "200"}, {"node": "300"}, {"node": "400"}, {"node": "1001"}],
+}
+
+
+def test_derived_branch_is_the_grandparent_of_the_own_subcategory():
+    own = [s.Subcategory("1001", "apparel", "Beanie-Mützen", 120)]
+    assert s.derived_branches(DE_PRODUCT, own) == [s.Branch("", "apparel", "300")]
+    assert s.derived_branches({**DE_PRODUCT, "categories": [{"node": "100"}, {"node": "200"}]}, own) == \
+        [s.Branch("", "apparel", "200")]
+    assert s.derived_branches({**DE_PRODUCT, "categories": [{"node": "100"}]}, own) == []
+    assert s.derived_branches(DE_PRODUCT, [s.Subcategory("1001", "", "x", 5)]) == []  # без раздела — не угадываем
+
+
+def test_search_in_another_country_walks_from_the_product_own_categories():
+    pages = {
+        DE_URL + "300": bs_page("Accessoires", top("RR", 50), siblings=[("400", "Mützen"), ("500", "Schals")], dept="apparel"),
+        DE_URL + "400": bs_page("Mützen & Caps", top("MM", 50), siblings=[("401", "Sonnenhüte"), ("402", "Beanies")], dept="apparel"),
+        DE_URL + "401": bs_page("Sonnenhüte", top("SS", 50), siblings=[("401", "Sonnenhüte"), ("402", "Beanies")], dept="apparel"),
+        DE_URL + "402": bs_page("Beanies", top("BB", 50), siblings=[("401", "Sonnenhüte"), ("402", "Beanies")], dept="apparel"),
+        DE_URL + "500": bs_page("Schals", top("CC", 50), siblings=[("500", "Schals")], dept="apparel"),
+        "https://www.amazon.de/dp/B0SS000001": leader_page(70000),
+    }
+    fake = Fake(pages, DE_PRODUCT)
+    result = s.search(OURS, "DE", fetch_product=fake.fetch_product, fetch_page=fake.fetch_page, cache=s.MemoryCache(),
+                      target_bsr=60000, now=NOW, derive_branches=True)
+    paths = {c.sub.node: c.sub.path for c in result.candidates}
+    assert paths["401"] == "Accessoires › Mützen › Sonnenhüte"  # путь начинается с названия со страницы
+    assert result.status == "done" and "500" in paths
+
+
+def test_without_derive_the_old_neighbour_walk_is_unchanged():
+    fake = Fake({}, DE_PRODUCT)
+    result = s.search(OURS, "DE", fetch_product=fake.fetch_product, fetch_page=fake.fetch_page, cache=s.MemoryCache(),
+                      target_bsr=60000, now=NOW)
+    assert all("apparel/300" not in u for u in fake.urls)
