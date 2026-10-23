@@ -9,6 +9,7 @@ best_seller.asin_changes в той же транзакции. Без Streamlit.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -226,6 +227,27 @@ RETURNING id;
 
 
 MAX_TARGET = 10_000_000
+
+
+SCHEMA_FILES = ("001_watchlist.sql", "002_search.sql")
+_SCHEMA_DIR = Path(__file__).resolve().parent / "best_seller_db"
+
+
+def schema_ready(connect: Connect) -> bool:
+    """Обе схемы (список ASIN и поиск) уже применены."""
+    return table_exists(connect) and search_tables_exist(connect)
+
+
+def ensure_schema(connect: Connect) -> bool:
+    """Применяет best_seller_db/001 и 002, если таблиц ещё нет. Возвращает True, если что-то применили.
+
+    Файлы написаны на CREATE ... IF NOT EXISTS, поэтому повтор безопасен; обе схемы идут одной транзакцией:
+    либо обе, либо ничего. Таблицы мониторинга (bsr_radar) не затрагиваются."""
+    if schema_ready(connect):
+        return False
+    statements = [((_SCHEMA_DIR / name).read_text(encoding="utf-8"), (), False) for name in SCHEMA_FILES]
+    dbutil.run_many(connect, statements, error=BestSellerStoreError, what="Создание таблиц раздела Best Seller")
+    return True
 
 
 def ensure_target_column(connect: Connect) -> None:
