@@ -1172,11 +1172,28 @@ def _render_hypotheses(connect) -> None:
                        disabled=shown.empty)
 
 
+def _ensure_schema_once(connect, can_edit: bool) -> None:
+    """Таблицы раздела создаются сами при первом открытии сотрудником с правом редактирования (раз за сессию).
+    Не вышло — раздел работает как раньше (пример из макета), сообщение подсказывает применить SQL вручную."""
+    if connect is None or not can_edit or st.session_state.get("bs_schema_ready"):
+        return
+    try:
+        created = best_seller_store.ensure_schema(connect)
+    except best_seller_store.BestSellerStoreError:
+        st.warning("Не удалось создать таблицы раздела в базе: примените best_seller_db/001_watchlist.sql и "
+                   "002_search.sql вручную.")
+        return
+    st.session_state["bs_schema_ready"] = True
+    if created:
+        st.success("Таблицы раздела Best Seller созданы в базе.")
+
+
 def render(connect=None, actor: str = "", can_edit: bool = False, token: str = "", dispatch_token: str = "",
            repo: str = "") -> None:
     """connect — подключение к базе дашборда (таблицы раздела — в схеме best_seller; None — нет базы);
     can_edit — может ли менять список."""
     st.markdown(_CSS, unsafe_allow_html=True)
+    _ensure_schema_once(connect, can_edit)
     mode = st.radio("Режим", MODES, horizontal=True, key="bs_mode", label_visibility="collapsed")
     if mode == MODES[0]:
         _render_single(connect, actor, can_edit, token)

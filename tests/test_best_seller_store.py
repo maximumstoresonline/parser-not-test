@@ -155,3 +155,49 @@ def test_manage_by_country_and_disable_selected(monkeypatch):
     # По умолчанию отключённые скрыты: в US активных нет.
     market.set_value("US").run(timeout=30)
     assert "В этой стране нет активных ASIN." in infos(at)
+
+
+class SchemaDb:
+    """Подключение-заглушка: to_regclass отвечает по флагу, остальные запросы запоминаются."""
+
+    def __init__(self, ready):
+        self.ready, self.executed, self.commits, self.rowcount = ready, [], 0, 0
+
+    def connect(self):
+        return self
+
+    def cursor(self):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=()):
+        self.executed.append(sql)
+        self._last = sql
+
+    def fetchall(self):
+        return [(self.ready,)]
+
+    def commit(self):
+        self.commits += 1
+
+    def close(self):
+        pass
+
+
+def test_ensure_schema_applies_both_files_when_tables_missing():
+    db = SchemaDb(ready=False)
+    assert store.ensure_schema(db.connect) is True
+    ddl = [q for q in db.executed if "CREATE SCHEMA" in q or "node_cache" in q]
+    assert len(ddl) == 2 and "best_seller.asins" in ddl[0] and "best_seller.search_results" in ddl[1]
+    assert not any("DROP" in q.upper() for q in db.executed) and db.commits == 2  # проверка таблиц + одна транзакция с обеими схемами
+
+
+def test_ensure_schema_does_nothing_when_ready():
+    db = SchemaDb(ready=True)
+    assert store.ensure_schema(db.connect) is False
+    assert not any("CREATE SCHEMA" in q for q in db.executed)
