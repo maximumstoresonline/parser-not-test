@@ -225,6 +225,8 @@ def test_admin_from_secret_gets_users_tab_without_database_lookup(monkeypatch, d
 
     monkeypatch.setattr(access, "active_user_roles", must_not_be_called)
     monkeypatch.setattr(access, "list_users", lambda connect: [])
+    # Список админов для «Скрыть админов» — отдельный вопрос, не роль вошедшего: здесь подменён.
+    monkeypatch.setattr(dash, "_dashboard_admins", lambda: frozenset())
     at = run_on_tab(JOURNAL)
     assert not at.exception
     assert [t.label for t in at.tabs] == ADMIN_TABS
@@ -935,3 +937,72 @@ def test_rating_and_reviews_stand_next_to_bsr_in_the_current_table(dash):
     after = columns.index("Δ BSR конкурента")
     assert columns[after + 1:after + 3] == ["Рейтинг конкурента", "Отзывов конкурента"]
     assert table.loc[0, "Рейтинг наш"] == "4.5" and table.loc[0, "Отзывов наш"] == "5576"
+
+
+
+# --- «Скрыть админов» на вкладке «Активность дашборда» -------------------------------------------------------
+
+def people(at):
+    return list(at.tabs[-1].dataframe[0].value["Сотрудник"])
+
+
+def test_employees_never_see_admins_in_the_activity_and_have_no_switch(monkeypatch, dash):
+    monkeypatch.setenv("ADMIN_EMAILS", "boss@maximumstores.online")
+    monkeypatch.setattr(access, "recent_logins", lambda connect, days=30, limit=5000: LOGINS)
+    at = run_on_tab(JOURNAL)
+    assert not at.exception
+    assert people(at) == ["anna"]
+    assert not at.tabs[-1].toggle
+
+
+def test_the_switch_is_on_for_an_admin_and_turning_it_off_shows_admins(monkeypatch, dash):
+    monkeypatch.setenv("ADMIN_EMAILS", "boss@maximumstores.online")
+    sign_in(monkeypatch, dash, employee("boss@maximumstores.online"))
+    monkeypatch.setattr(access, "list_users", lambda connect: [])
+    monkeypatch.setattr(access, "recent_logins", lambda connect, days=30, limit=5000: LOGINS)
+    at = run_on_tab(JOURNAL)
+    assert not at.exception
+    switch = at.toggle(key="journal_hide_admins")
+    assert switch.label == "Скрыть админов" and switch.value is True
+    assert people(at) == ["anna"]
+    switch.set_value(False).run()
+    assert people(at) == ["anna", "boss"]
+
+
+def test_admins_from_the_database_are_hidden_too(monkeypatch, dash):
+    monkeypatch.setattr(access, "active_user_roles",
+                        lambda connect: {"anna@maximumstores.online": "editor", "boss@maximumstores.online": "admin"})
+    monkeypatch.setattr(access, "recent_logins", lambda connect, days=30, limit=5000: LOGINS)
+    assert people(run_on_tab(JOURNAL)) == ["anna"]
+
+
+def test_hidden_admins_do_not_count_in_the_scorecard(monkeypatch, dash):
+    monkeypatch.setenv("ADMIN_EMAILS", "boss@maximumstores.online")
+    monkeypatch.setattr(access, "recent_logins", lambda connect, days=30, limit=5000: SCORE_LOGINS)
+    monkeypatch.setattr(access, "allowed_table_exists", lambda connect: True)
+    monkeypatch.setattr(access, "list_allowed", lambda connect: ALLOWED)
+    shown = metrics(run_on_tab(JOURNAL))
+    assert shown["Зашли"][0] == "1 из 2"  # boss не в числителе и не в знаменателе
+
+
+def test_hidden_admins_leave_sections_time_and_changes(monkeypatch, dash, actions):
+    import activity
+    import usage_log
+
+    monkeypatch.setenv("ADMIN_EMAILS", "boss@maximumstores.online")
+    events = [
+        {"session_id": "s1", "email": "anna@maximumstores.online", "at": at_kyiv(20, 9, 0), "section": PUBLIC_TABS[0]},
+        {"session_id": "s2", "email": "boss@maximumstores.online", "at": at_kyiv(20, 10, 0), "section": "📈 Прогноз"},
+    ]
+    monkeypatch.setattr(activity, "recent", lambda connect, days=30, limit=50000: events)
+    monkeypatch.setattr(usage_log, "log_exists", lambda connect: True)
+    monkeypatch.setattr(usage_log, "recent", lambda connect, days=30: [
+        {"user_name": "boss@maximumstores.online", "action": "pairs_add", "created_at": at_kyiv(20, 10)}])
+    at = run_on_tab(JOURNAL)
+    assert not at.exception
+    frames = [d.value for d in at.tabs[-1].dataframe]
+    sections = next(f for f in frames if "Раздел" in f.columns)
+    assert dict(zip(sections["Раздел"], sections["Открытий"]))["📈 Прогноз"] == 0
+    time_spent = next(f for f in frames if "Сессий" in f.columns)
+    assert list(time_spent["Сотрудник"]) == ["anna"]
+    assert not any("Правок" in f.columns and "Последняя правка" in f.columns and len(f) for f in frames)

@@ -770,7 +770,8 @@ GitHub, а проверка решает, пора ли: своё расписа
 7 дней: регулярность — сколько дней из пяти рабочих в среднем заходит человек, сколько допущенных
 зашли и сравнение с прошлой неделей. Ниже за выбранный период: кто сколько входил, сколько разделов
 открыл и правок сделал, какие разделы открывают, сколько времени проводят и кто что меняет.
-Список допущенных для Scorecard и роли ведёт админ внизу этой вкладки.
+Список допущенных для Scorecard и роли ведёт админ внизу этой вкладки. Админы в статистике не
+учитываются; админ может показать их переключателем «Скрыть админов».
 
 **Отчёт в Telegram.** После каждого сбора бот присылает подписчикам отчёт по нашим товарам и
 конкурентам. Подписаться — кнопка бота вверху страницы, затем отправить ему /start.
@@ -1974,6 +1975,26 @@ def _render_changes(rows: list | str | None) -> None:
         st.dataframe(_usage_log_table(rows), use_container_width=True, hide_index=True)
 
 
+def _dashboard_admins() -> frozenset:
+    """Почты админов дашборда — по тому же правилу, что роль в _resolve_access: секрет ADMIN_EMAILS плюс активные
+    админы из bsr_radar.dashboard_users. База недоступна — только админы из секрета."""
+    admins = set(access.parse_email_list(_secret("ADMIN_EMAILS")))
+    try:
+        admins |= {mail for mail, user_role in access.active_user_roles(_connect).items()
+                   if user_role == access.ROLE_ADMIN}
+    except access.AccessStoreError:
+        pass
+    return frozenset(filter(None, (access.normalize_email(mail) for mail in admins)))
+
+
+def _without_people(rows: list | str | None, key: str, hidden: frozenset) -> list | str | None:
+    """Строки журнала без людей из hidden (по полю key с почтой); ошибку и «нет таблицы» не трогает."""
+    if not hidden or not isinstance(rows, list):
+        return rows
+    return [row for row in rows
+            if access.normalize_email(row[key] if isinstance(row, dict) else row) not in hidden]
+
+
 def _render_journal_tab(email: str, role: str | None) -> None:
     """Порядок как в Rating Radar: заголовок с «Обновить», Scorecard за 7 дней, период, кто пользуется,
     разделы; ниже — наши дополнительные разделы и управление для админа."""
@@ -1981,7 +2002,17 @@ def _render_journal_tab(email: str, role: str | None) -> None:
     head.markdown('<p class="section-title">Активность дашборда</p>', unsafe_allow_html=True)
     if refresh.button("🔄 Обновить", key="journal_refresh", use_container_width=True):
         _activity_on.clear()  # журнал действий могли только что подключить
-    logins, allowed = _load_logins(), _load_allowed()
+    # Админы (кто настраивает и проверяет дашборд) искажают Scorecard и «Кто пользуется»: по умолчанию их не видно.
+    # Переключатель — только у админа; остальные сотрудники всегда видят статистику без админов.
+    hide_admins = True
+    if role == access.ROLE_ADMIN:
+        hide_admins = st.toggle("Скрыть админов", value=True, key="journal_hide_admins",
+                                help="Убирает людей с ролью «админ» из всей статистики вкладки: Scorecard, «Кто "
+                                     "пользуется», разделы, время, правки, входы. Раздел «Пользователи и роли» "
+                                     "не меняется.")
+    hidden = _dashboard_admins() if hide_admins else frozenset()
+    logins = _without_people(_load_logins(), "email", hidden)
+    allowed = _without_people(_load_allowed(), "email", hidden)
     card = None
     if isinstance(logins, list):
         card = _scorecard(logins, allowed, _now()) if isinstance(allowed, list) and allowed else None
@@ -1999,7 +2030,8 @@ def _render_journal_tab(email: str, role: str | None) -> None:
     if isinstance(allowed, str) and role != access.ROLE_ADMIN:
         allowed = None  # ошибку списка допущенных видит админ в своём разделе; остальным она ни к чему
     since = _now() - timedelta(days=days)
-    actions, usage = _load_activity(), _load_usage()
+    actions = _without_people(_load_activity(), "email", hidden)
+    usage = _without_people(_load_usage(), "user_name", hidden)
     if isinstance(actions, list):
         actions = [row for row in actions if row["at"] >= since]
     if isinstance(usage, list):
