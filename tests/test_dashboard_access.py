@@ -14,7 +14,7 @@ import schedule_store
 SCRIPT = "import dashboard_db\ndashboard_db.main()"
 PUBLIC_TABS = ["📋 Текущее состояние", "📅 История", "📈 Прогноз", "🥊 Пары конкурентов",
                "⚙ Сбор и управление", "ℹ️ Как это работает", "📊 Активность дашборда"]
-# Журнал открыт всем сотрудникам; админа отличает раздел «Пользователи и роли» внутри него.
+# Журнал открыт всем сотрудникам; админа отличают «Допущенные для Scorecard» и «Скрыть админов» внутри него.
 # Раздел в разработке «Best Seller подкатегории» — отдельный переключатель над вкладками, а не вкладка
 # (tests/test_dashboard_preview_tab.py), поэтому вкладки у админа те же.
 ADMIN_TABS = PUBLIC_TABS
@@ -206,32 +206,34 @@ def test_signed_in_employee_without_a_role_sees_data_and_their_name(dash):
     assert len(buttons(at, "logout_btn")) == 1 and not buttons(at, "login_btn")
 
 
-def test_editor_from_database_sees_role_but_no_admin_tab(monkeypatch, dash):
+def test_roles_come_only_from_the_secret_and_the_database_is_not_asked(monkeypatch, dash):
+    """Решение владельца 26.10.2026: роли — только через секрет ADMIN_EMAILS, таблица ролей в базе не читается."""
+    def must_not_be_called(connect):
+        raise AssertionError("роли из базы больше не читаются")
+
+    monkeypatch.setattr(access, "active_user_roles", must_not_be_called)
     sign_in(monkeypatch, dash, employee("Ed@MaximumStores.online"))
-    monkeypatch.setattr(access, "active_user_roles", lambda connect: {"ed@maximumstores.online": "editor"})
     at = run()
     assert not at.exception
-    assert "ed@maximumstores.online · редактор" in page_text(at)
-    assert len(buttons(at, "logout_btn")) == 1
+    assert "ed@maximumstores.online · только просмотр" in page_text(at)
     assert [t.label for t in at.tabs] == PUBLIC_TABS
 
 
-def test_admin_from_secret_gets_users_tab_without_database_lookup(monkeypatch, dash):
+def test_admin_from_secret_has_no_role_management_on_the_page(monkeypatch, dash):
     monkeypatch.setenv("ADMIN_EMAILS", "Boss@MaximumStores.online")
     sign_in(monkeypatch, dash, employee("boss@maximumstores.online"))
 
     def must_not_be_called(connect):
-        raise AssertionError("админу из секрета база для роли не нужна")
+        raise AssertionError("ролей в базе больше нет")
 
     monkeypatch.setattr(access, "active_user_roles", must_not_be_called)
-    monkeypatch.setattr(access, "list_users", lambda connect: [])
-    # Список админов для «Скрыть админов» — отдельный вопрос, не роль вошедшего: здесь подменён.
-    monkeypatch.setattr(dash, "_dashboard_admins", lambda: frozenset())
+    monkeypatch.setattr(access, "list_users", must_not_be_called)
     at = run_on_tab(JOURNAL)
     assert not at.exception
     assert [t.label for t in at.tabs] == ADMIN_TABS
     assert "boss@maximumstores.online · админ" in page_text(at)
-    assert any("В базе пока никого нет" in info.value for info in at.info)
+    assert "Пользователи и роли" not in journal_text(at)
+    assert not [b for b in at.button if b.label == "Добавить или обновить"]
 
 
 def test_an_outside_admin_from_the_secret_is_still_not_let_in(monkeypatch, dash):
@@ -259,52 +261,6 @@ def test_unverified_email_never_gets_access_even_if_listed_as_admin(monkeypatch,
     at = run()
     assert not at.exception and not at.tabs
     assert any("Доступ только для сотрудников" in e.value for e in at.error)
-
-
-def test_unavailable_user_list_fails_closed_and_page_still_renders(monkeypatch, dash):
-    """Сотрудник без общей роли (EMPLOYEE_ROLE = None) и без доступа к списку — только просмотр."""
-    def broken(connect):
-        raise access.AccessStoreError("Операция со списком пользователей не подтверждена (OperationalError).")
-
-    monkeypatch.setattr(access, "active_user_roles", broken)
-    at = run()
-    assert not at.exception
-    assert any("Доступ к управлению временно закрыт" in w.value for w in at.warning)
-    assert [t.label for t in at.tabs] == PUBLIC_TABS
-    assert "только просмотр" in page_text(at)
-
-
-def test_admin_adds_user_through_the_form_with_admin_rights(monkeypatch, dash):
-    monkeypatch.setenv("ADMIN_EMAILS", "boss@maximumstores.online")
-    sign_in(monkeypatch, dash, employee("boss@maximumstores.online"))
-    monkeypatch.setattr(access, "list_users", lambda connect: [])
-    calls = []
-
-    def fake_add_user(connect, email, role, *, actor_role, actor_email):
-        calls.append((email, role, actor_role, actor_email))
-        return access.normalize_email(email)
-
-    monkeypatch.setattr(access, "add_user", fake_add_user)
-    at = run_on_tab(JOURNAL)
-    at.text_input(key="add_user_email").input("New@X.com")
-    at.selectbox(key="add_user_role").select(access.ROLE_ADMIN)
-    [b for b in at.button if b.label == "Добавить или обновить"][0].click()
-    at.run(timeout=30)
-    assert not at.exception
-    assert calls == [("New@X.com", access.ROLE_ADMIN, access.ROLE_ADMIN, "boss@maximumstores.online")]
-    assert any("Сохранено: new@x.com" in s.value for s in at.success)
-
-
-def test_form_shows_validation_error_instead_of_crashing(monkeypatch, dash):
-    monkeypatch.setenv("ADMIN_EMAILS", "boss@maximumstores.online")
-    sign_in(monkeypatch, dash, employee("boss@maximumstores.online"))
-    monkeypatch.setattr(access, "list_users", lambda connect: [])
-    at = run_on_tab(JOURNAL)
-    at.text_input(key="add_user_email").input("not-an-email")
-    [b for b in at.button if b.label == "Добавить или обновить"][0].click()
-    at.run(timeout=30)
-    assert not at.exception
-    assert any("Некорректный email" in e.value for e in at.error)
 
 
 def unlock(at, name="Аня", password=TEAM_PASSWORD):
@@ -641,15 +597,6 @@ def test_the_journal_reads_the_database_only_when_its_tab_is_open(monkeypatch, d
     assert not run().exception
 
 
-def test_admin_also_manages_roles_in_the_journal_tab(monkeypatch, dash):
-    monkeypatch.setenv("ADMIN_EMAILS", "boss@maximumstores.online")
-    sign_in(monkeypatch, dash, employee("boss@maximumstores.online"))
-    monkeypatch.setattr(access, "list_users", lambda connect: [])
-    at = run_on_tab(JOURNAL)
-    assert not at.exception
-    assert "Пользователи и роли" in journal_text(at)
-
-
 def test_a_broken_login_log_does_not_break_the_page(monkeypatch, dash):
     def broken(connect, days=30, limit=5000):
         raise access.AccessStoreError("Журнал недоступен.")
@@ -969,11 +916,13 @@ def test_the_switch_is_on_for_an_admin_and_turning_it_off_shows_admins(monkeypat
     assert people(at) == ["anna", "boss"]
 
 
-def test_admins_from_the_database_are_hidden_too(monkeypatch, dash):
-    monkeypatch.setattr(access, "active_user_roles",
-                        lambda connect: {"anna@maximumstores.online": "editor", "boss@maximumstores.online": "admin"})
+def test_an_admin_role_in_the_database_does_not_count(monkeypatch, dash):
+    def must_not_be_called(connect):
+        raise AssertionError("роли из базы больше не читаются")
+
+    monkeypatch.setattr(access, "active_user_roles", must_not_be_called)
     monkeypatch.setattr(access, "recent_logins", lambda connect, days=30, limit=5000: LOGINS)
-    assert people(run_on_tab(JOURNAL)) == ["anna"]
+    assert people(run_on_tab(JOURNAL)) == ["anna", "boss"]  # boss не в ADMIN_EMAILS — не админ
 
 
 def test_hidden_admins_do_not_count_in_the_scorecard(monkeypatch, dash):

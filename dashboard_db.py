@@ -101,7 +101,8 @@ def _current_user() -> dict:
 
 
 # Права любого вошедшего сотрудника. Решение владельца 01.10.2026: все сотрудники могут всё — пары,
-# время сбора, запуск сбора; админы (вкладка «Активность дашборда», раздел «Пользователи и роли») — по-прежнему из ADMIN_EMAILS и базы.
+# время сбора, запуск сбора. Админы — только из секрета ADMIN_EMAILS (решение владельца 26.10.2026: роли меняет
+# только тот, у кого доступ к настройкам дашборда; таблица ролей в базе не читается, раздела «Пользователи и роли» нет).
 # None — сотрудник только смотрит, пока ему не дадут роль или он не откроет «🔒 Управление».
 EMPLOYEE_ROLE: str | None = access.ROLE_EDITOR
 
@@ -114,14 +115,7 @@ def _resolve_access() -> tuple[dict, str | None, str | None]:
     if email is None:
         return user, None, None
     admin_emails = access.parse_email_list(_secret("ADMIN_EMAILS"))
-    db_roles: dict = {}
-    if email not in admin_emails:
-        try:
-            db_roles = access.active_user_roles(_connect)
-        except access.AccessStoreError as exc:
-            if EMPLOYEE_ROLE is None:
-                st.warning(f"{exc} Доступ к управлению временно закрыт.")
-    return user, email, access.resolve_role(user, admin_emails, db_roles) or EMPLOYEE_ROLE
+    return user, email, access.resolve_role(user, admin_emails, {}) or EMPLOYEE_ROLE
 
 
 @st.cache_resource
@@ -770,8 +764,8 @@ GitHub, а проверка решает, пора ли: своё расписа
 7 дней: регулярность — сколько дней из пяти рабочих в среднем заходит человек, сколько допущенных
 зашли и сравнение с прошлой неделей. Ниже за выбранный период: кто сколько входил, сколько разделов
 открыл и правок сделал, какие разделы открывают, сколько времени проводят и кто что меняет.
-Список допущенных для Scorecard и роли ведёт админ внизу этой вкладки. Админы в статистике не
-учитываются; админ может показать их переключателем «Скрыть админов».
+Список допущенных для Scorecard ведёт админ внизу этой вкладки. Админы задаются только в
+настройках дашборда и в статистике не учитываются; админ может показать их переключателем «Скрыть админов».
 
 **Отчёт в Telegram.** После каждого сбора бот присылает подписчикам отчёт по нашим товарам и
 конкурентам. Подписаться — кнопка бота вверху страницы, затем отправить ему /start.
@@ -1976,15 +1970,9 @@ def _render_changes(rows: list | str | None) -> None:
 
 
 def _dashboard_admins() -> frozenset:
-    """Почты админов дашборда — по тому же правилу, что роль в _resolve_access: секрет ADMIN_EMAILS плюс активные
-    админы из bsr_radar.dashboard_users. База недоступна — только админы из секрета."""
-    admins = set(access.parse_email_list(_secret("ADMIN_EMAILS")))
-    try:
-        admins |= {mail for mail, user_role in access.active_user_roles(_connect).items()
-                   if user_role == access.ROLE_ADMIN}
-    except access.AccessStoreError:
-        pass
-    return frozenset(filter(None, (access.normalize_email(mail) for mail in admins)))
+    """Почты админов дашборда — по тому же правилу, что роль в _resolve_access: только секрет ADMIN_EMAILS."""
+    return frozenset(filter(None, (access.normalize_email(mail)
+                                   for mail in access.parse_email_list(_secret("ADMIN_EMAILS")))))
 
 
 def _without_people(rows: list | str | None, key: str, hidden: frozenset) -> list | str | None:
@@ -2008,8 +1996,7 @@ def _render_journal_tab(email: str, role: str | None) -> None:
     if role == access.ROLE_ADMIN:
         hide_admins = st.toggle("Скрыть админов", value=True, key="journal_hide_admins",
                                 help="Убирает людей с ролью «админ» из всей статистики вкладки: Scorecard, «Кто "
-                                     "пользуется», разделы, время, правки, входы. Раздел «Пользователи и роли» "
-                                     "не меняется.")
+                                     "пользуется», разделы, время, правки, входы.")
     hidden = _dashboard_admins() if hide_admins else frozenset()
     logins = _without_people(_load_logins(), "email", hidden)
     allowed = _without_people(_load_allowed(), "email", hidden)
@@ -2103,55 +2090,6 @@ def _render_journal(journal: LoginJournal | str, actions: list | str | None, ema
         )
     if role == access.ROLE_ADMIN:
         _render_allowed_admin(allowed, email, role)
-        st.markdown('<p class="section-title">Пользователи и роли</p>', unsafe_allow_html=True)
-        _render_users_panel(email, role)
-
-
-def _render_users_panel(actor_email: str, actor_role: str) -> None:
-    _show_flash("users_flash")
-    try:
-        users = access.list_users(_connect)
-    except access.AccessStoreError as exc:
-        st.error(str(exc))
-        return
-
-    if users:
-        table = pd.DataFrame(users).rename(columns={
-            "email": "Email", "role": "Роль", "active": "Активен", "added_by": "Добавил", "created_at": "Добавлен",
-        })
-        table["Роль"] = table["Роль"].map(_ROLE_LABELS)
-        table["Активен"] = table["Активен"].map({True: "да", False: "нет"})
-        st.dataframe(table, use_container_width=True, hide_index=True)
-    else:
-        st.info("В базе пока никого нет. Админы из секрета ADMIN_EMAILS работают без записи в базе.")
-
-    with st.form("add_user_form", clear_on_submit=True):
-        new_email = st.text_input("Email (с которым человек входит через Google)", key="add_user_email")
-        new_role = st.selectbox(
-            "Роль", [access.ROLE_EDITOR, access.ROLE_ADMIN], format_func=_ROLE_LABELS.get, key="add_user_role",
-        )
-        if st.form_submit_button("Добавить или обновить"):
-            try:
-                saved = access.add_user(_connect, new_email, new_role, actor_role=actor_role, actor_email=actor_email)
-            except (ValueError, access.AccessDenied, access.AccessStoreError) as exc:
-                st.error(str(exc))
-            else:
-                _set_flash("users_flash", "success", f"Сохранено: {saved}")
-                st.rerun()
-
-    if users:
-        with st.form("toggle_user_form"):
-            target = st.selectbox("Пользователь", [u["email"] for u in users], key="toggle_user_email")
-            action = st.radio("Действие", ["Включить", "Отключить"], horizontal=True, key="toggle_user_action")
-            if st.form_submit_button("Применить"):
-                enable = action == "Включить"
-                try:
-                    access.set_user_active(_connect, target, enable, actor_role=actor_role, actor_email=actor_email)
-                except (ValueError, access.AccessDenied, access.AccessStoreError) as exc:
-                    st.error(str(exc))
-                else:
-                    _set_flash("users_flash", "success", f"{target}: {'включён' if enable else 'отключён'}")
-                    st.rerun()
 
 
 def main() -> None:
